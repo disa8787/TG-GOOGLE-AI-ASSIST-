@@ -1,0 +1,4 @@
+# .bat хранятся с CRLF как есть (корректно и при скачивании ZIP)
+*.bat -text
+*.sh  text eol=lf
+*.py  text eol=lf
