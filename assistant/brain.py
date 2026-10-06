@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta
 
 from .config import Config
@@ -23,6 +24,7 @@ from .util import fmt_local, now_line, truncate, utcnow
 log = logging.getLogger(__name__)
 
 WATCH_PAYLOAD_CHARS = 60000
+WATCH_MAX_PASSES = 3
 
 
 PURPOSES = {"chat": "чат", "report": "отчёты", "watch": "фоновая проверка", "learn": "изучение истории"}
@@ -58,7 +60,9 @@ class Assistant:
     def save_profile(self, text: str) -> None:
         self.profile_path.write_text(text.strip() + "\n", encoding="utf-8")
 
-    def memory_text(self) -> str:
+    def memory_text(self, focus: str | None = None) -> str:
+        """Заметки памяти для модели. Если все не помещаются — сначала те, что относятся к focus
+        (например, к изучаемому куску переписки), затем самые свежие; остальные — через search_memory."""
         rows = self.db.all_memory()
         if not rows:
             return "(пусто)"
@@ -67,11 +71,18 @@ class Assistant:
         total = sum(len(x) + 1 for x in lines.values())
         keep = set(lines)
         if total > limit:
-            # не влезает — оставляем самые свежие заметки, остальное доступно через search_memory
+            focus_low = (focus or "").lower()
+
+            def relevant(r) -> bool:
+                words = [w for w in re.findall(r"\w+", r["subject"].lower()) if len(w) >= 4]
+                return any(w in focus_low for w in words)
+
+            ordered = sorted(rows, key=lambda r: (relevant(r) if focus_low else False, r["updated_at"]),
+                             reverse=True)
             keep, size = set(), 0
-            for r in sorted(rows, key=lambda r: r["updated_at"], reverse=True):
+            for r in ordered:
                 if size + len(lines[r["id"]]) > limit:
-                    break
+                    continue
                 keep.add(r["id"])
                 size += len(lines[r["id"]]) + 1
         text = "\n".join(lines[r["id"]] for r in rows if r["id"] in keep)
@@ -146,42 +157,68 @@ class Assistant:
 
     # ------------------------------------------------------------------ фоновое наблюдение
     async def watch_check(self, ignored: set[int] | None = None) -> str | None:
-        """Смотрит новые сообщения и изменения в таблицах. Возвращает уведомление или None."""
+        """Смотрит новые сообщения и изменения в таблицах. Возвращает уведомление или None.
+
+        Старая история, скачанная задним числом (новый чат, первая выгрузка), сюда не попадает.
+        Если новых сообщений много, они разбираются по порядку в несколько заходов — ничего не пропускается;
+        что не поместилось сейчас — будет в следующей проверке.
+        """
         changes = await self.sheets.snapshot_all(self.db) if self.cfg.sheets else []
 
         top = self.db.max_message_rowid()
         cursor = self.db.get_kv("watch_last_rowid")
         if cursor is None:
-            # первый запуск — архив целиком уже изучен через learn, начинаем с текущего момента
+            # первый запуск — архив целиком изучается через learn, начинаем с текущего момента
             self.db.set_kv("watch_last_rowid", str(top))
-            rows = []
-        else:
-            chats = self.db.monitored_chat_ids() - (ignored or set())
-            rows = [r for r in self.db.messages_after_rowid(int(cursor), chats) if r["id"] <= top]
+            cursor = str(top)
+        cursor_id = int(cursor)
+        chats = self.db.monitored_chat_ids() - (ignored or set())
 
-        if not rows and not changes:
+        notes: list[str] = []
+        for _ in range(WATCH_MAX_PASSES):
+            rows = [r for r in self.db.messages_after_rowid(cursor_id, chats, limit=5000, exclude_backfill=True)
+                    if r["id"] <= top]
+            page, size = [], 0
+            for r in rows:
+                line_len = len(r["text"] or "") + 120
+                if page and size + line_len > WATCH_PAYLOAD_CHARS:
+                    break
+                page.append(r)
+                size += line_len
+            if not page and not changes:
+                break
+            parts = []
+            if page:
+                more = len(rows) - len(page)
+                parts.append(f"Новые сообщения ({len(page)}"
+                             + (f"; ещё {more} — в следующем заходе" if more else "") + "):\n"
+                             + self.tools.format_messages(page))
+            if changes:
+                parts.append("Изменения в таблицах:\n" + truncate("\n\n".join(changes), 30000))
+                changes = []
+            prompt = f"{self.stamp()}\n" + WATCH_REQUEST.format(payload="\n\n".join(parts))
+            async with self.lock:
+                answer = await self.llm.run_agent(
+                    purpose="watch", model=self.cfg.watch_model, system=self.system(),
+                    messages=[{"role": "user", "content": prompt}], toolbox=self.tools, effort=self.cfg.effort_watch,
+                )
+            if page:
+                cursor_id = page[-1]["id"]
+                self.db.set_kv("watch_last_rowid", str(cursor_id))
+            text = answer.strip()
+            if text and not text.upper().startswith("NOTHING"):
+                notes.append(text)
+            if len(page) == len(rows):
+                break  # всё новое разобрано
+
+        # дальше «новых» нет (остались только строки старой истории) — сдвигаем отметку до конца
+        remaining = self.db.messages_after_rowid(cursor_id, chats, limit=1, exclude_backfill=True)
+        if not [r for r in remaining if r["id"] <= top]:
             self.db.set_kv("watch_last_rowid", str(top))
-            return None
 
-        parts = []
-        if rows:
-            text = self.tools.format_messages(rows)
-            if len(text) > WATCH_PAYLOAD_CHARS:
-                text = "…(более ранние новые сообщения пропущены, их можно прочитать через read_chat)\n" + \
-                       text[-WATCH_PAYLOAD_CHARS:]
-            parts.append(f"Новые сообщения ({len(rows)}):\n{text}")
-        if changes:
-            parts.append("Изменения в таблицах:\n" + truncate("\n\n".join(changes), 30000))
-        prompt = f"{self.stamp()}\n" + WATCH_REQUEST.format(payload="\n\n".join(parts))
-
-        async with self.lock:
-            answer = await self.llm.run_agent(
-                purpose="watch", model=self.cfg.watch_model, system=self.system(),
-                messages=[{"role": "user", "content": prompt}], toolbox=self.tools, effort=self.cfg.effort_watch,
-            )
-        self.db.set_kv("watch_last_rowid", str(top))
-        if answer.strip().upper().startswith("NOTHING") or not answer.strip():
+        if not notes:
             return None
+        answer = "\n\n".join(notes)
         self.db.add_report("watch", answer)
         self.db.add_dialog("user", f"{self.stamp()}\n(автоматически) Фоновая проверка новых сообщений и таблиц.")
         self.db.add_dialog("assistant", answer)

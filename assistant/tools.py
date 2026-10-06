@@ -262,6 +262,9 @@ class ToolBox:
 
     def _chat_ids(self, chat: str | None) -> list[int] | None:
         ids = self.db.find_chat_ids(chat)
+        if ids:
+            monitored = self.db.monitored_chat_ids()
+            ids = [i for i in ids if i in monitored]
         if ids is not None and not ids:
             raise ToolError(f"чат «{chat}» не найден в архиве. Список: list_chats")
         return ids
@@ -272,7 +275,7 @@ class ToolBox:
     def format_messages(self, rows) -> str:
         """Сообщения → текст для модели. Сообщения владельца подписаны «Я»."""
         titles = self.db.chat_titles()
-        edits = self.db.edits_for([r["id"] for r in rows if r["edited_at"]])
+        edits = self.db.edits_for([r["id"] for r in rows])
         lines = []
         for r in rows:
             author = "Я" if r["outgoing"] else (r["sender_name"] or r["sender_id"] or "?")
@@ -306,7 +309,7 @@ class ToolBox:
         rows = self.db.search_messages(
             query, mode=mode, chat_ids=self._chat_ids(chat), sender=sender, outgoing=outgoing,
             date_from=self._date(date_from), date_to=self._date(date_to, end=True),
-            limit=max(1, min(int(limit), 200)),
+            limit=max(1, min(int(limit), 200)), only_monitored=True,
         )
         if not rows:
             return "Ничего не найдено. Попробуй другую форму слова, mode='any' или без фильтров."
@@ -316,23 +319,22 @@ class ToolBox:
                     around_message_id: int | None = None, limit: int = 100) -> str:
         rows = self.db.read_messages(
             self._chat_ids(chat), date_from=self._date(date_from), date_to=self._date(date_to, end=True),
-            around=around_message_id, limit=max(1, min(int(limit), 400)),
+            around=around_message_id, limit=max(1, min(int(limit), 400)), only_monitored=True,
         )
         if not rows:
             return "Сообщений за этот период нет."
         return self.format_messages(rows)
 
     def t_list_chats(self) -> str:
-        rows = self.db.chats()
+        # исключённые владельцем чаты ассистенту не показываем вовсе
+        rows = [r for r in self.db.chats() if r["monitored"]]
         if not rows:
             return "Архив пуст — история ещё не скачана (команда download)."
-        lines = []
-        for r in rows:
-            mark = "" if r["monitored"] else " (не отслеживается)"
-            lines.append(
-                f"«{r['title']}» id={r['chat_id']} [{r['kind']}] — {r['n']} сообщ., "
-                f"{fmt_local(r['first_date'], self.cfg.tz)[:10]} … {fmt_local(r['last_date'], self.cfg.tz)}{mark}"
-            )
+        lines = [
+            f"«{r['title']}» id={r['chat_id']} [{r['kind']}] — {r['n']} сообщ., "
+            f"{fmt_local(r['first_date'], self.cfg.tz)[:10]} … {fmt_local(r['last_date'], self.cfg.tz)}"
+            for r in rows
+        ]
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ Google Таблицы
@@ -402,9 +404,17 @@ class ToolBox:
 
     def t_search_memory(self, query: str) -> str:
         rows = self.db.search_memory(query)
-        if not rows:
+        old = self.db.search_memory_history(query)
+        if not rows and not old:
             return "В памяти ничего не найдено."
-        return "\n".join(f"#{r['id']} [{r['category']}] {r['subject']}: {r['content']}" for r in rows)
+        out = [f"#{r['id']} [{r['category']}] {r['subject']}: {r['content']}" for r in rows]
+        if old:
+            out.append("\nПрежние версии заметок (до изменения или удаления):")
+            out += [
+                f"• {r['subject']} — {r['change']} {fmt_local(r['saved_at'], self.cfg.tz)}, было: {r['old_content']}"
+                for r in old
+            ]
+        return "\n".join(out)
 
     # ------------------------------------------------------------------ напоминания
     def t_create_reminder(self, text: str, at: str | None = None, in_minutes: int | None = None,

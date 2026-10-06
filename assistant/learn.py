@@ -16,6 +16,7 @@ from .prompts import (
     SHEETS_SYSTEM,
 )
 from .sheets import format_table, normalize
+from .telegram_archive import ChatFilter
 from .util import fmt_local, mask_cards, to_db, truncate, utcnow
 
 log = logging.getLogger(__name__)
@@ -79,6 +80,10 @@ class Chunk:
         return ", ".join(names[:3]) + f" и ещё {len(names) - 3} чатов"
 
 
+def _unlearned(db, chat_id: int) -> list:
+    return [r for r in db.unlearned_messages(chat_id) if r["text"] or r["media"]]
+
+
 def build_plan(asst: Assistant, selected: set[int] | None) -> list[Chunk]:
     cfg, db = asst.cfg, asst.db
     chunks: list[Chunk] = []
@@ -88,9 +93,7 @@ def build_plan(asst: Assistant, selected: set[int] | None) -> list[Chunk]:
             continue  # чат исключён из анализа
         if selected is not None and chat["chat_id"] not in selected:
             continue
-        cursor = int(db.get_kv(f"learn_cursor:{chat['chat_id']}") or 0)
-        rows = [r for r in db.chat_messages_for_learning(chat["chat_id"], cursor) if r["text"] or r["media"]]
-        for r in rows:
+        for r in _unlearned(db, chat["chat_id"]):
             line = _line(r, cfg.tz, cfg.mask_cards)
             if cur.lines and cur.size + len(line) > cfg.learn_chunk_chars:
                 chunks.append(cur)
@@ -101,6 +104,30 @@ def build_plan(asst: Assistant, selected: set[int] | None) -> list[Chunk]:
     return chunks
 
 
+def nightly_scope(asst: Assistant) -> tuple[set[int], list[tuple[str, int, int]]]:
+    """Что можно изучать ночью без подтверждения: чаты, которые владелец уже одобрил ручным learn,
+    и небольшие новые чаты (до одной части). Крупная неизученная история откладывается до ручного learn —
+    возвращается списком (название, сообщений, символов)."""
+    cfg, db = asst.cfg, asst.db
+    eligible: set[int] = set()
+    deferred: list[tuple[str, int, int]] = []
+    for chat in db.chats():
+        if not chat["monitored"]:
+            continue
+        if db.get_kv(f"learn_cursor:{chat['chat_id']}") is not None:
+            eligible.add(chat["chat_id"])
+            continue
+        rows = _unlearned(db, chat["chat_id"])
+        if not rows:
+            continue
+        chars = sum(len(_line(r, cfg.tz, False)) + 1 for r in rows)
+        if chars <= cfg.learn_chunk_chars:
+            eligible.add(chat["chat_id"])
+        else:
+            deferred.append((chat["title"] or str(chat["chat_id"]), len(rows), chars))
+    return eligible, deferred
+
+
 def _confirm(question: str) -> bool:
     try:
         return input(question).strip().lower() in ("y", "yes", "д", "да")
@@ -109,13 +136,16 @@ def _confirm(question: str) -> bool:
 
 
 async def learn_history(asst: Assistant, chat_filter: list[str] | None, model: str, yes: bool,
-                        say: Say = print, max_chunks: int | None = None) -> bool:
+                        say: Say = print, max_chunks: int | None = None,
+                        only_chats: set[int] | None = None) -> bool:
     cfg, db = asst.cfg, asst.db
     selected = None
     if chat_filter:
         selected = set()
         for spec in chat_filter:
             selected.update(db.find_chat_ids(spec) or [])
+    if only_chats is not None:
+        selected = only_chats if selected is None else selected & only_chats
 
     plan = build_plan(asst, selected)
     if not plan:
@@ -141,9 +171,9 @@ async def learn_history(asst: Assistant, chat_filter: list[str] | None, model: s
     for idx, chunk in enumerate(plan, 1):
         period = chunk.period(cfg.tz)
         say(f"[{idx}/{len(plan)}] {chunk.label()} {period} ({chunk.count} сообщ.)…")
-        prompt = LEARN_CHUNK_PROMPT.format(
-            period=period, notes=asst.memory_text(), chunk="\n".join(chunk.lines).strip(),
-        )
+        chunk_text = "\n".join(chunk.lines).strip()
+        # заметки о людях и темах из этого куска — в первую очередь, чтобы их дополнять, а не перезаписывать
+        prompt = LEARN_CHUNK_PROMPT.format(period=period, notes=asst.memory_text(focus=chunk_text), chunk=chunk_text)
         try:
             data = await asst.llm.ask_json(
                 purpose="learn", system=LEARN_SYSTEM, prompt=prompt, schema=LEARN_SCHEMA,
@@ -159,7 +189,8 @@ async def learn_history(asst: Assistant, chat_filter: list[str] | None, model: s
             only = next(iter(chunk.rows)) if len(chunk.rows) == 1 else None
             db.add_learn_note(only, period, data["summary"])
         for chat_id, rows in chunk.rows.items():
-            db.set_kv(f"learn_cursor:{chat_id}", str(max(r["id"] for r in rows)))
+            db.mark_learned([r["id"] for r in rows])
+            db.set_kv(f"learn_cursor:{chat_id}", "1")  # чат одобрен для изучения (ночью — без вопросов)
         say(f"    + {len(facts)} заметок, всего в памяти {db.memory_count()}")
     return True
 
@@ -205,6 +236,16 @@ async def build_profile(asst: Assistant, model: str, say: Say = print) -> bool:
     if not notes and not db.memory_count():
         say("Нечего обобщать — сначала скачай историю (download).")
         return False
+    # если всё не помещается — отбрасываем самые старые изложения (по дате конца периода), а не целые чаты
+    def period_end(n) -> str:
+        return (n["period"] or "").split("—")[-1].strip()
+
+    notes = sorted(notes, key=lambda n: (period_end(n), n["id"]))
+    dropped, size = 0, sum(len(n["summary"]) + 40 for n in notes)
+    while notes and size > PROFILE_INPUT_CHARS:
+        size -= len(notes[0]["summary"]) + 40
+        notes = notes[1:]
+        dropped += 1
     by_chat: dict = {}
     for n in notes:
         by_chat.setdefault(n["chat_id"], []).append(f"[{n['period']}] {n['summary']}")
@@ -213,8 +254,8 @@ async def build_profile(asst: Assistant, model: str, say: Say = print) -> bool:
         + "\n" + "\n".join(items)
         for cid, items in by_chat.items()
     )
-    if len(summaries) > PROFILE_INPUT_CHARS:
-        summaries = "…(самые ранние периоды пропущены)\n" + summaries[-PROFILE_INPUT_CHARS:]
+    if dropped:
+        summaries = f"…(пропущено {dropped} самых старых изложений — не поместились)\n\n" + summaries
     prompt = (
         f"# Владелец\n{db.get_kv('owner_name') or 'неизвестно'} (в переписке — «Я»)\n\n"
         f"# Изложение переписки по чатам и периодам\n{summaries or '(нет)'}\n\n"
@@ -237,6 +278,8 @@ async def build_profile(asst: Assistant, model: str, say: Say = print) -> bool:
 async def run_learn(asst: Assistant, *, chats: list[str] | None, reset: bool, yes: bool,
                     sheets_only: bool, model: str | None) -> None:
     model = model or asst.cfg.model
+    # исключения из config.yaml применяем и к уже скачанному — исключённое не уходит в Claude
+    ChatFilter(asst.cfg, asst.db).apply_to_db(asst.db)
     if reset:
         asst.db.reset_learning()
         print("Прогресс изучения сброшен — история будет изучена заново (память сохраняется).")

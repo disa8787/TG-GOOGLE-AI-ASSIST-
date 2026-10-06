@@ -21,7 +21,10 @@ CREATE TABLE IF NOT EXISTS chats(
     username  TEXT,
     kind      TEXT,
     monitored INTEGER NOT NULL DEFAULT 1,
-    last_sync TEXT
+    last_sync TEXT,
+    synced_msg_id INTEGER NOT NULL DEFAULT 0, -- история скачана подряд до этого id (живые сообщения не в счёт)
+    since_date    TEXT,                       -- нижняя граница из download --since
+    explicit      INTEGER NOT NULL DEFAULT 0  -- чат выбран явно (--chat / список в конфиге)
 );
 
 CREATE TABLE IF NOT EXISTS messages(
@@ -39,6 +42,8 @@ CREATE TABLE IF NOT EXISTS messages(
     edited_at   TEXT,
     outgoing    INTEGER NOT NULL DEFAULT 0,
     deleted_at  TEXT,
+    learned     INTEGER NOT NULL DEFAULT 0, -- уже изучено (learn) — попало в память
+    backfill    INTEGER NOT NULL DEFAULT 0, -- старая история, скачанная задним числом (не «новое»)
     UNIQUE(chat_id, msg_id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_date ON messages(chat_id, date);
@@ -62,6 +67,17 @@ CREATE TABLE IF NOT EXISTS memory(
     source     TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+-- прежние версии заметок памяти: при обновлении/удалении старый текст не теряется
+CREATE TABLE IF NOT EXISTS memory_history(
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    note_id    INTEGER NOT NULL,
+    category   TEXT,
+    subject    TEXT NOT NULL,
+    old_content TEXT NOT NULL,
+    change     TEXT NOT NULL,
+    saved_at   TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS reminders(
@@ -144,6 +160,20 @@ WHEN old.text <> new.text AND old.text <> '' BEGIN
     INSERT INTO message_edits(message_id, old_text, saved_at)
     VALUES (old.id, old.text, strftime('%Y-%m-%d %H:%M:%S', 'now'));
 END;
+CREATE TRIGGER IF NOT EXISTS memory_keep_updates AFTER UPDATE OF content ON memory
+WHEN old.content <> new.content BEGIN
+    INSERT INTO memory_history(note_id, category, subject, old_content, change, saved_at)
+    VALUES (old.id, old.category, old.subject, old.content, 'изменена', strftime('%Y-%m-%d %H:%M:%S', 'now'));
+END;
+CREATE TRIGGER IF NOT EXISTS memory_keep_deletes AFTER DELETE ON memory BEGIN
+    INSERT INTO memory_history(note_id, category, subject, old_content, change, saved_at)
+    VALUES (old.id, old.category, old.subject, old.content, 'удалена', strftime('%Y-%m-%d %H:%M:%S', 'now'));
+END;
+"""
+
+# Индексы по колонкам, которые в старых базах появляются только после миграции
+POST_MIGRATION = """
+CREATE INDEX IF NOT EXISTS idx_messages_learn ON messages(chat_id, learned, date);
 """
 
 MESSAGE_COLUMNS = (
@@ -154,6 +184,8 @@ MESSAGE_COLUMNS = (
 # Сообщения в личках и обычных группах имеют сквозную нумерацию по аккаунту,
 # у каналов и супергрупп (id вида -100…) — своя нумерация внутри канала.
 CHANNEL_ID_LIMIT = -1_000_000_000_000
+
+MONITORED_ONLY = "{col} IN (SELECT chat_id FROM chats WHERE monitored=1)"
 
 
 def _ulower(value):
@@ -175,6 +207,7 @@ class DB:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
         self._migrate()
+        self.conn.executescript(POST_MIGRATION)
         self.conn.executescript(EDIT_TRIGGER)
         self._init_fts()
 
@@ -182,11 +215,33 @@ class DB:
     def _migrate(self) -> None:
         """Добавляет новые колонки в базы, созданные прошлыми версиями."""
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(messages)")}
+        chat_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(chats)")}
         with self.conn:
             if "outgoing" not in cols:
                 self.conn.execute("ALTER TABLE messages ADD COLUMN outgoing INTEGER NOT NULL DEFAULT 0")
             if "deleted_at" not in cols:
                 self.conn.execute("ALTER TABLE messages ADD COLUMN deleted_at TEXT")
+            if "backfill" not in cols:
+                self.conn.execute("ALTER TABLE messages ADD COLUMN backfill INTEGER NOT NULL DEFAULT 0")
+            if "learned" not in cols:
+                self.conn.execute("ALTER TABLE messages ADD COLUMN learned INTEGER NOT NULL DEFAULT 0")
+                # прошлые версии запоминали прогресс изучения курсором (id строки) по каждому чату
+                for r in self.conn.execute("SELECT key, value FROM kv WHERE key LIKE 'learn_cursor:%'").fetchall():
+                    chat_id = r["key"].split(":", 1)[1]
+                    if chat_id.lstrip("-").isdigit() and str(r["value"]).isdigit():
+                        self.conn.execute("UPDATE messages SET learned=1 WHERE chat_id=? AND id<=?",
+                                          (int(chat_id), int(r["value"])))
+            if "synced_msg_id" not in chat_cols:
+                self.conn.execute("ALTER TABLE chats ADD COLUMN synced_msg_id INTEGER NOT NULL DEFAULT 0")
+                # всё, что уже лежит в архиве, считаем скачанным подряд
+                self.conn.execute(
+                    "UPDATE chats SET synced_msg_id = coalesce("
+                    "(SELECT max(msg_id) FROM messages m WHERE m.chat_id = chats.chat_id), 0)"
+                )
+            if "since_date" not in chat_cols:
+                self.conn.execute("ALTER TABLE chats ADD COLUMN since_date TEXT")
+            if "explicit" not in chat_cols:
+                self.conn.execute("ALTER TABLE chats ADD COLUMN explicit INTEGER NOT NULL DEFAULT 0")
 
     def _init_fts(self) -> None:
         exists = self.conn.execute(
@@ -246,6 +301,32 @@ class DB:
         with self.conn:
             self.conn.execute("UPDATE chats SET monitored=? WHERE chat_id=?", (int(monitored), chat_id))
 
+    def chat_row(self, chat_id: int) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM chats WHERE chat_id=?", (chat_id,)).fetchone()
+
+    def synced_msg_id(self, chat_id: int) -> int:
+        row = self.chat_row(chat_id)
+        return int(row["synced_msg_id"] or 0) if row else 0
+
+    def advance_synced(self, chat_id: int, msg_id: int) -> None:
+        """Отметка «история скачана подряд до msg_id». Двигается только вперёд и только выгрузкой истории."""
+        with self.conn:
+            self.conn.execute(
+                "UPDATE chats SET synced_msg_id=max(synced_msg_id, ?) WHERE chat_id=?", (msg_id, chat_id)
+            )
+
+    def set_since(self, chat_id: int, since: str | None) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE chats SET since_date=? WHERE chat_id=?", (since, chat_id))
+
+    def set_explicit(self, chat_id: int, explicit: bool = True) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE chats SET explicit=? WHERE chat_id=?", (int(explicit), chat_id))
+
+    def is_explicit(self, chat_id: int) -> bool:
+        row = self.chat_row(chat_id)
+        return bool(row and row["explicit"])
+
     def chats(self) -> list[sqlite3.Row]:
         return self.conn.execute(
             "SELECT c.*, (SELECT count(*) FROM messages m WHERE m.chat_id=c.chat_id) AS n, "
@@ -287,19 +368,25 @@ class DB:
         return int(row["m"] or 0)
 
     def upsert_messages(self, rows: Iterable[dict]) -> int:
+        """Сохраняет сообщения. Поле backfill=1 у строки — старая история (не «новое» для фоновой проверки);
+        оно ставится только при первой вставке. Ранее сохранённый файл вложения не затирается пустым."""
         rows = list(rows)
         if not rows:
             return 0
-        cols = ", ".join(MESSAGE_COLUMNS)
-        marks = ", ".join("?" for _ in MESSAGE_COLUMNS)
-        updates = ", ".join(f"{c}=excluded.{c}" for c in MESSAGE_COLUMNS if c not in ("chat_id", "msg_id"))
+        insert_cols = (*MESSAGE_COLUMNS, "backfill")
+        cols = ", ".join(insert_cols)
+        marks = ", ".join("?" for _ in insert_cols)
+        updates = ", ".join(
+            "media_path=coalesce(excluded.media_path, media_path)" if c == "media_path" else f"{c}=excluded.{c}"
+            for c in MESSAGE_COLUMNS if c not in ("chat_id", "msg_id")
+        )
         sql = (
             f"INSERT INTO messages({cols}) VALUES({marks}) "
             f"ON CONFLICT(chat_id, msg_id) DO UPDATE SET {updates}"
         )
-        defaults = {"text": "", "outgoing": 0}
+        defaults = {"text": "", "outgoing": 0, "backfill": 0}
         values = [
-            tuple(r.get(c) if r.get(c) is not None else defaults.get(c) for c in MESSAGE_COLUMNS) for r in rows
+            tuple(r.get(c) if r.get(c) is not None else defaults.get(c) for c in insert_cols) for r in rows
         ]
         with self.conn:
             self.conn.executemany(sql, values)
@@ -323,6 +410,21 @@ class DB:
                     f"AND msg_id IN ({marks})",
                     (now, CHANNEL_ID_LIMIT, *msg_ids),
                 )
+        return cur.rowcount
+
+    def recent_ids(self, chat_id: int, since: str, max_msg_id: int) -> set[int]:
+        rows = self.conn.execute(
+            "SELECT msg_id FROM messages WHERE chat_id=? AND date > ? AND msg_id <= ? AND deleted_at IS NULL",
+            (chat_id, since, max_msg_id),
+        ).fetchall()
+        return {r["msg_id"] for r in rows}
+
+    def backfill_outgoing(self, owner_id: int) -> int:
+        """Помечает «Я» сообщения владельца, сохранённые до появления этой пометки."""
+        with self.conn:
+            cur = self.conn.execute(
+                "UPDATE messages SET outgoing=1 WHERE outgoing=0 AND sender_id=?", (owner_id,)
+            )
         return cur.rowcount
 
     def edits_for(self, message_ids: list[int]) -> dict[int, list[str]]:
@@ -359,8 +461,11 @@ class DB:
         date_to: str | None = None,
         limit: int = 40,
         outgoing: bool | None = None,
+        only_monitored: bool = False,
     ) -> list[sqlite3.Row]:
         where, params = [], []
+        if only_monitored:
+            where.append(MONITORED_ONLY.format(col="m.chat_id"))
         match = self._fts_query(query, mode)
         if match:
             base = "SELECT m.* FROM messages_fts f JOIN messages m ON m.id=f.rowid"
@@ -397,15 +502,19 @@ class DB:
         date_to: str | None = None,
         around: int | None = None,
         limit: int = 100,
+        only_monitored: bool = False,
     ) -> list[sqlite3.Row]:
         where, params = [], []
+        if only_monitored:
+            where.append(MONITORED_ONLY.format(col="chat_id"))
         if chat_ids is not None:
             where.append(f"chat_id IN ({','.join('?' * len(chat_ids)) or 'NULL'})")
             params.extend(chat_ids)
         if around is not None:
             row = self.conn.execute(
                 "SELECT date FROM messages WHERE msg_id=?"
-                + (f" AND chat_id IN ({','.join('?' * len(chat_ids))})" if chat_ids else ""),
+                + (f" AND chat_id IN ({','.join('?' * len(chat_ids))})" if chat_ids else "")
+                + (" AND " + MONITORED_ONLY.format(col="chat_id") if only_monitored else ""),
                 [around, *(chat_ids or [])],
             ).fetchone()
             if row:
@@ -435,9 +544,12 @@ class DB:
         sql = f"SELECT * FROM messages{clause} ORDER BY date DESC, msg_id DESC LIMIT ?"
         return list(reversed(self.conn.execute(sql, [*params, limit]).fetchall()))
 
-    def messages_after_rowid(self, rowid: int, chat_ids: set[int] | None = None, limit: int = 100000):
+    def messages_after_rowid(self, rowid: int, chat_ids: set[int] | None = None, limit: int = 100000,
+                             exclude_backfill: bool = False):
         sql = "SELECT * FROM messages WHERE id > ?"
         params: list = [rowid]
+        if exclude_backfill:
+            sql += " AND backfill = 0"
         if chat_ids is not None:
             sql += f" AND chat_id IN ({','.join('?' * len(chat_ids)) or 'NULL'})"
             params.extend(chat_ids)
@@ -445,11 +557,19 @@ class DB:
         params.append(limit)
         return self.conn.execute(sql, params).fetchall()
 
-    def chat_messages_for_learning(self, chat_id: int, after_rowid: int) -> list[sqlite3.Row]:
+    def unlearned_messages(self, chat_id: int) -> list[sqlite3.Row]:
+        """Ещё не изученные сообщения чата, по времени. Отметка learned ставится на каждое сообщение,
+        поэтому порядок вставки в базу не важен и ничего не пропускается."""
         return self.conn.execute(
-            "SELECT * FROM messages WHERE chat_id=? AND id > ? ORDER BY date ASC, msg_id ASC",
-            (chat_id, after_rowid),
+            "SELECT * FROM messages WHERE chat_id=? AND learned=0 ORDER BY date ASC, msg_id ASC",
+            (chat_id,),
         ).fetchall()
+
+    def mark_learned(self, rowids: list[int]) -> None:
+        with self.conn:
+            for start in range(0, len(rowids), 500):
+                part = rowids[start:start + 500]
+                self.conn.execute(f"UPDATE messages SET learned=1 WHERE id IN ({','.join('?' * len(part))})", part)
 
     def max_message_rowid(self) -> int:
         row = self.conn.execute("SELECT max(id) AS m FROM messages").fetchone()
@@ -495,6 +615,17 @@ class DB:
                 scored.append((score, r["updated_at"], r))
         scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
         return [r for _, _, r in scored[:limit]]
+
+    def search_memory_history(self, query: str, limit: int = 10) -> list[sqlite3.Row]:
+        """Прежние версии заметок (до изменения/удаления) — чтобы ничего не терялось."""
+        words = [w for w in re.findall(r"\w+", query.lower()) if len(w) >= 2]
+        if not words:
+            return []
+        where = " AND ".join("ulower(subject || ' ' || old_content) LIKE ?" for _ in words)
+        return self.conn.execute(
+            f"SELECT * FROM memory_history WHERE {where} ORDER BY id DESC LIMIT ?",
+            [*(f"%{w}%" for w in words), limit],
+        ).fetchall()
 
     def memory_count(self) -> int:
         return int(self.conn.execute("SELECT count(*) AS n FROM memory").fetchone()["n"])
@@ -633,6 +764,7 @@ class DB:
 
     def reset_learning(self) -> None:
         with self.conn:
+            self.conn.execute("UPDATE messages SET learned=0")
             self.conn.execute("DELETE FROM learn_notes")
             self.conn.execute("DELETE FROM kv WHERE key LIKE 'learn_cursor:%'")
 

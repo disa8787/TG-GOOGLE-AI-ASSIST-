@@ -66,7 +66,7 @@ async def cmd_chats(cfg, args) -> None:
         uname = getattr(d.entity, "username", None)
         n = archived.get(d.id)
         if cfg.all_chats:
-            reason = chat_filter.reason_excluded(d.entity, d.name)
+            reason = chat_filter.reason_excluded(d.entity, d.name, db.is_explicit(d.id))
             verdict = "✓ берём" if reason is None else f"✗ {reason}"
             taken += reason is None
             skipped += reason is not None
@@ -83,11 +83,13 @@ async def cmd_chats(cfg, args) -> None:
 
 
 async def cmd_download(cfg, args) -> None:
+    from telethon import utils
+
     from .db import DB
     from .telegram_archive import (
-        TELEGRAM_SERVICE_ID,
         ChatFilter,
         all_dialog_entities,
+        chat_kind,
         connect_user,
         display_name,
         download_chat,
@@ -96,26 +98,47 @@ async def cmd_download(cfg, args) -> None:
     from .util import parse_local
 
     db = DB(cfg.data_dir / "assistant.db")
-    if args.include_channels:
-        cfg.include_channels = True
     chat_filter = ChatFilter(cfg, db)
     chat_filter.apply_to_db(db)
     client = await connect_user(cfg, db)
     skipped: dict[str, int] = {}
+    explicit_ids: set[int] = set()  # выбраны явно — потом не отключаются флагами include_*
     if args.chat:
         entities, missing = await resolve_chats(client, args.chat)
         for m in missing:
             print(f"⚠️ Чат «{m}» не найден (посмотри точное название/ID: assistant chats)")
-        # явно выбранный чат берём, кроме служебных (коды входа, токены ботов)
-        entities = [e for e in entities if getattr(e, "id", None) != TELEGRAM_SERVICE_ID
-                    and (getattr(e, "username", None) or "").lower() != "botfather"]
+        kept = []
+        for e in entities:
+            reason = chat_filter.reason_excluded(e, explicit=True)
+            if reason:
+                print(f"⚠️ «{display_name(e)}» пропущен: {reason}")
+            else:
+                kept.append(e)
+        entities = kept
+        explicit_ids = {utils.get_peer_id(e) for e in entities}
     elif args.all or cfg.all_chats:
-        entities, skipped = await all_dialog_entities(client, chat_filter)
+        entities, skipped = await all_dialog_entities(client, chat_filter, db)
+        if args.include_channels:
+            # каналы, явно запрошенные флагом, запоминаем — они останутся в архиве и дальше
+            async for d in client.iter_dialogs():
+                if chat_kind(d.entity) == "канал" and chat_filter.allows(d.entity, d.name, explicit=True):
+                    if all(utils.get_peer_id(e) != d.id for e in entities):
+                        entities.append(d.entity)
+                    explicit_ids.add(d.id)
+            skipped = {k: v for k, v in skipped.items() if not k.startswith("канал")}
     else:
         entities, missing = await resolve_chats(client, cfg.chats)
         for m in missing:
             print(f"⚠️ Чат «{m}» не найден (посмотри точное название/ID: assistant chats)")
-        entities = [e for e in entities if chat_filter.allows(e)]
+        kept = []
+        for e in entities:
+            reason = chat_filter.reason_excluded(e, explicit=True)
+            if reason:
+                print(f"⚠️ «{display_name(e)}» пропущен: {reason}")
+            else:
+                kept.append(e)
+        entities = kept
+        explicit_ids = {utils.get_peer_id(e) for e in entities}
 
     since = parse_local(args.since, cfg.tz) if args.since else None
     media = args.media or cfg.download_media
@@ -131,6 +154,7 @@ async def cmd_download(cfg, args) -> None:
         print(f"[{i}/{len(entities)}] {name}", flush=True)
         try:
             n = await download_chat(client, db, ent, since=since, media_dir=media_dir,
+                                    explicit=utils.get_peer_id(ent) in explicit_ids,
                                     media_max_bytes=cfg.media_max_mb * 1024 * 1024)
         except Exception as e:  # noqa: BLE001
             print(f"  ⚠️ ошибка: {e}")
@@ -241,7 +265,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("download", help="скачать историю чатов в локальный архив")
     s.add_argument("--chat", action="append", help="только этот чат (ID, @username или название); можно повторять")
     s.add_argument("--all", action="store_true", help="все чаты (как chats: all в config.yaml)")
-    s.add_argument("--include-channels", action="store_true", help="ещё и каналы")
+    s.add_argument("--include-channels", action="store_true",
+                   help="ещё и каналы (запоминаются; чтобы брать каналы всегда — include_channels: true)")
     s.add_argument("--since", help="только начиная с даты YYYY-MM-DD (для первой выгрузки)")
     s.add_argument("--media", action="store_true", help="скачивать фото и файлы")
 

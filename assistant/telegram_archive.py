@@ -12,16 +12,23 @@ import logging
 import os
 import sys
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from telethon import TelegramClient, events, utils
 from telethon.tl.custom.message import Message
-from telethon.tl.types import Channel, Chat, MessageService, User
+from telethon.tl.types import (
+    Channel,
+    ChannelForbidden,
+    Chat,
+    ChatForbidden,
+    MessageService,
+    User,
+)
 
 from .config import Config
 from .db import DB
-from .util import to_db
+from .util import from_db, to_db, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -29,25 +36,45 @@ log = logging.getLogger(__name__)
 TELEGRAM_SERVICE_ID = 777000
 ALWAYS_EXCLUDED_USERNAMES = {"botfather"}
 
-# Разрешённые запросы к Telegram: только чтение. Всё остальное (Send*, Edit*, Delete*, Forward*,
-# Read* — «прочитано», Set* — «печатает», Update* — «в сети» и т.д.) блокируется до отправки в сеть.
-READ_ONLY_PREFIXES = (
-    "Get", "Search", "Resolve", "Check", "Ping", "InvokeWith", "InitConnection",
-    "ExportAuthorization", "ImportAuthorization", "ReuploadCdnFile",
-)
+# Разрешённые запросы к Telegram — только чтение. Всё остальное (Send*, Edit*, Delete*, Forward*,
+# Read* — «прочитано», Set* — «печатает», Update* — «в сети», платежи, звонки, истории, настройки
+# аккаунта и т.д.) блокируется до отправки в сеть.
+READ_ONLY_PREFIXES = ("Get", "Search", "Resolve", "Check")
+READ_ONLY_NAMESPACES = {"messages", "channels", "users", "contacts", "updates", "upload", "help", "photos"}
+SERVICE_REQUESTS = {  # служебные запросы соединения и скачивания файлов с других дата-центров
+    "InvokeWithLayerRequest", "InitConnectionRequest", "InvokeWithoutUpdatesRequest",
+    "PingRequest", "PingDelayDisconnectRequest",
+    "ExportAuthorizationRequest", "ImportAuthorizationRequest", "ReuploadCdnFileRequest",
+}
+# «Читающие» по названию запросы, у которых есть побочные эффекты — тоже запрещены
+SIDE_EFFECT_REQUESTS = {
+    "GetBotCallbackAnswerRequest",   # нажатие инлайн-кнопки от имени владельца
+    "GetInlineBotResultsRequest",    # запрос к инлайн-боту (бот видит запрос)
+    "GetLocatedRequest",             # может опубликовать геопозицию в «Люди рядом»
+    "GetMessagesViewsRequest",       # может увеличивать счётчик просмотров
+}
 
 
 class ReadOnlyViolation(PermissionError):
     """Попытка что-то изменить в Telegram от имени владельца — запрещено."""
 
 
+def _request_allowed(r) -> bool:
+    name = type(r).__name__
+    namespace = type(r).__module__.rsplit(".", 1)[-1]
+    if name in SIDE_EFFECT_REQUESTS:
+        return False
+    if name in SERVICE_REQUESTS:
+        return namespace in ("functions", "auth", "upload")
+    return namespace in READ_ONLY_NAMESPACES and name.startswith(READ_ONLY_PREFIXES)
+
+
 def _assert_read_only(request) -> None:
     requests = list(request) if utils.is_list_like(request) else [request]
     for r in requests:
-        name = type(r).__name__
-        if not name.startswith(READ_ONLY_PREFIXES):
+        if not _request_allowed(r):
             raise ReadOnlyViolation(
-                f"Запрос {name} заблокирован: ассистент работает с твоим Telegram только на чтение"
+                f"Запрос {type(r).__name__} заблокирован: ассистент работает с твоим Telegram только на чтение"
             )
         inner = getattr(r, "query", None)  # InvokeWithLayer / InitConnection оборачивают другой запрос
         if inner is not None and not isinstance(inner, (str, bytes)):
@@ -84,7 +111,11 @@ def make_user_client(cfg: Config, read_only: bool = True) -> TelegramClient:
 
 def remember_owner(db: DB, me) -> None:
     db.set_kv("owner_tg_id", str(me.id))
-    db.set_kv("owner_name", display_name(me) or "")
+    db.set_kv("owner_name", utils.get_display_name(me) or getattr(me, "username", None) or str(me.id))
+    # сообщения владельца, сохранённые прошлыми версиями без пометки «Я»
+    if db.get_kv("outgoing_backfilled") != str(me.id):
+        db.backfill_outgoing(me.id)
+        db.set_kv("outgoing_backfilled", str(me.id))
 
 
 def login_hint() -> str:
@@ -139,6 +170,8 @@ async def login(cfg: Config, db: DB | None) -> None:
 
 # ---------------------------------------------------------------------- описание чатов и сообщений
 def chat_kind(entity) -> str:
+    if isinstance(entity, (ChannelForbidden, ChatForbidden)):
+        return "нет доступа"
     if isinstance(entity, User):
         if entity.is_self:
             return "избранное"
@@ -262,16 +295,23 @@ async def message_to_row(
 
 
 # ---------------------------------------------------------------------- какие чаты брать
+SERVICE_REASON = "служебный (коды входа/токены) — не архивируется никогда"
+KIND_FLAGS = {"канал": "include_channels", "бот": "include_bots", "избранное": "include_saved"}
+
+
 class ChatFilter:
-    """Решает, какие чаты архивировать и анализировать."""
+    """Решает, какие чаты архивировать и анализировать.
+
+    Явно выбранные чаты (--chat, список в telegram.chats) берутся всегда, кроме служебных и exclude_chats;
+    для остальных действуют и флаги include_channels / include_bots / include_saved_messages.
+    """
 
     def __init__(self, cfg: Config, db: DB | None = None):
         self.cfg = cfg
         self.excluded_ids: set[int] = set()
         self.excluded_names: set[str] = set()
-        self.excluded_usernames: set[str] = set(ALWAYS_EXCLUDED_USERNAMES)
-        if cfg.bot_id:
-            self.excluded_ids.add(cfg.bot_id)
+        self.excluded_usernames: set[str] = set()
+        self.own_bot_id = cfg.bot_id
         for spec in cfg.exclude_chats:
             text = str(spec).strip()
             if text.lstrip("-").isdigit():
@@ -286,53 +326,68 @@ class ChatFilter:
                 if (title or "").lower() in self.excluded_names:
                     self.excluded_ids.add(chat_id)
 
-    def reason_excluded(self, entity, name: str | None = None) -> str | None:
-        """None — чат подходит; иначе — причина, почему он пропущен."""
-        peer_id = utils.get_peer_id(entity)
-        raw_id = getattr(entity, "id", None)
-        username = (getattr(entity, "username", None) or "").lower()
-        title = (name or display_name(entity) or "").lower()
-        if raw_id == TELEGRAM_SERVICE_ID or username in ALWAYS_EXCLUDED_USERNAMES:
-            return "служебный (коды входа/токены) — не архивируется никогда"
-        if peer_id in self.excluded_ids or raw_id in self.excluded_ids:
-            return "в списке exclude_chats" if raw_id != self.cfg.bot_id else "это бот ассистента"
-        if username and username in self.excluded_usernames:
-            return "в списке exclude_chats"
-        if title and title in self.excluded_names:
-            return "в списке exclude_chats"
-        if isinstance(entity, User):
-            if entity.is_self:
-                return None if self.cfg.include_saved else "Избранное выключено (include_saved_messages)"
-            if entity.bot:
-                return None if self.cfg.include_bots else "бот (include_bots: false)"
-        if isinstance(entity, Channel) and not entity.megagroup:
-            return None if self.cfg.include_channels else "канал (include_channels: false)"
+    def _listed(self, peer_id: int, raw_id: int | None, username: str, title: str) -> bool:
+        return (
+            peer_id in self.excluded_ids or (raw_id is not None and raw_id in self.excluded_ids)
+            or (bool(username) and username in self.excluded_usernames)
+            or (bool(title) and title in self.excluded_names)
+        )
+
+    def _service(self, raw_id: int | None, username: str) -> bool:
+        return raw_id == TELEGRAM_SERVICE_ID or username in ALWAYS_EXCLUDED_USERNAMES or (
+            self.own_bot_id is not None and raw_id == self.own_bot_id
+        )
+
+    def _kind_reason(self, kind: str) -> str | None:
+        flag = KIND_FLAGS.get(kind)
+        if kind == "нет доступа":
+            return "нет доступа к чату (удалили или вышел)"
+        if flag and not getattr(self.cfg, flag):
+            names = {"include_channels": "include_channels", "include_bots": "include_bots",
+                     "include_saved": "include_saved_messages"}
+            return f"{kind} ({names[flag]}: false)"
         return None
 
-    def allows(self, entity, name: str | None = None) -> bool:
-        return self.reason_excluded(entity, name) is None
+    def reason_excluded(self, entity, name: str | None = None, explicit: bool = False) -> str | None:
+        """None — чат подходит; иначе — причина, почему он пропущен."""
+        raw_id = getattr(entity, "id", None)
+        username = (getattr(entity, "username", None) or "").lower()
+        if self._service(raw_id, username):
+            return "это бот ассистента" if raw_id == self.own_bot_id else SERVICE_REASON
+        try:
+            peer_id = utils.get_peer_id(entity)
+        except Exception:  # noqa: BLE001
+            return "неизвестный тип чата"
+        title = (name or display_name(entity) or "").lower()
+        if self._listed(peer_id, raw_id, username, title):
+            return "в списке exclude_chats"
+        kind = chat_kind(entity)
+        if kind == "нет доступа":
+            return self._kind_reason(kind)
+        return None if explicit else self._kind_reason(kind)
+
+    def allows(self, entity, name: str | None = None, explicit: bool = False) -> bool:
+        return self.reason_excluded(entity, name, explicit) is None
 
     def apply_to_db(self, db: DB) -> int:
-        """Снимает с отслеживания уже скачанные чаты, которые теперь исключены настройками."""
-        kinds_off = set()
-        if not self.cfg.include_channels:
-            kinds_off.add("канал")
-        if not self.cfg.include_bots:
-            kinds_off.add("бот")
-        if not self.cfg.include_saved:
-            kinds_off.add("избранное")
+        """Приводит отметку «отслеживается» у уже скачанных чатов в соответствие с настройками
+        (в т.ч. включает обратно чат, который убрали из исключений). Возвращает число изменений."""
         changed = 0
         for c in db.chats():
-            if not c["monitored"]:
-                continue
             raw = abs(c["chat_id"])
-            if (
-                c["chat_id"] in self.excluded_ids or raw == TELEGRAM_SERVICE_ID
-                or (c["username"] or "").lower() in self.excluded_usernames
-                or (c["title"] or "").lower() in self.excluded_names
-                or c["kind"] in kinds_off
-            ):
-                db.set_monitored(c["chat_id"], False)
+            username = (c["username"] or "").lower()
+            explicit = bool(c["explicit"]) or not self.cfg.all_chats
+            excluded = (
+                self._service(raw, username)
+                or self._listed(c["chat_id"], None, username, (c["title"] or "").lower())
+                or c["kind"] == "нет доступа"
+                or (not explicit and self._kind_reason(c["kind"] or "") is not None)
+            )
+            want = not excluded
+            if not self.cfg.all_chats and not excluded:
+                want = bool(c["monitored"])  # в режиме списка чаты сами не включаем
+            if bool(c["monitored"]) != want:
+                db.set_monitored(c["chat_id"], want)
                 changed += 1
         return changed
 
@@ -368,11 +423,13 @@ async def resolve_chats(client: TelegramClient, specs: list):
     return list(found.values()), missing
 
 
-async def all_dialog_entities(client: TelegramClient, chat_filter: ChatFilter) -> tuple[list, dict[str, int]]:
+async def all_dialog_entities(client: TelegramClient, chat_filter: ChatFilter,
+                              db: DB | None = None) -> tuple[list, dict[str, int]]:
     """Все подходящие чаты аккаунта (включая архивную папку) + статистика пропущенных по причинам."""
     result, skipped = [], {}
     async for d in client.iter_dialogs():
-        reason = chat_filter.reason_excluded(d.entity, d.name)
+        explicit = db.is_explicit(d.id) if db is not None else False
+        reason = chat_filter.reason_excluded(d.entity, d.name, explicit)
         if reason:
             skipped[reason] = skipped.get(reason, 0) + 1
             continue
@@ -381,42 +438,96 @@ async def all_dialog_entities(client: TelegramClient, chat_filter: ChatFilter) -
 
 
 # ---------------------------------------------------------------------- выгрузка
+BACKFILL_GRACE = timedelta(minutes=30)
+
+
 async def download_chat(
     client: TelegramClient,
     db: DB,
     entity,
     *,
     since: datetime | None = None,
+    explicit: bool = False,
     media_dir: Path | None = None,
     media_max_bytes: int = 0,
     progress: Callable[[str], None] = print,
 ) -> int:
-    """Скачивает историю чата в базу. Повторный запуск докачивает только новые сообщения."""
+    """Скачивает историю чата в базу.
+
+    Повторный запуск докачивает с отметки synced_msg_id — её двигает только эта функция, поэтому сообщения,
+    сохранённые «вживую» во время выгрузки, не приводят к пропуску истории. Если выгрузка прервалась,
+    следующий запуск продолжит с последней сохранённой пачки.
+    """
     chat_id = utils.get_peer_id(entity)
     title = display_name(entity) or str(chat_id)
     db.upsert_chat(chat_id, title, getattr(entity, "username", None), chat_kind(entity))
     db.set_monitored(chat_id, True)
+    if explicit:
+        db.set_explicit(chat_id, True)
 
-    last_id = db.last_msg_id(chat_id)
+    synced = db.synced_msg_id(chat_id)
+    first_time = synced == 0
+    if since is not None and first_time:
+        db.set_since(chat_id, to_db(since))
+    elif since is None and first_time:
+        row = db.chat_row(chat_id)
+        if row and row["since_date"]:
+            since = from_db(row["since_date"])  # граница из прошлого download --since
+
     kwargs: dict = {"reverse": True, "wait_time": 0.5}
-    if last_id:
-        kwargs["min_id"] = last_id
+    if synced:
+        kwargs["min_id"] = synced
     elif since:
         kwargs["offset_date"] = since
 
+    # первая выгрузка — это старая история: фоновая проверка не должна считать её «новыми сообщениями»
+    backfill_before = utcnow() - BACKFILL_GRACE if first_time else None
+
     batch: list[dict] = []
     total = 0
+
+    def flush() -> int:
+        if not batch:
+            return 0
+        n = db.upsert_messages(batch)
+        db.advance_synced(chat_id, max(r["msg_id"] for r in batch))
+        batch.clear()
+        return n
+
     async for msg in client.iter_messages(entity, **kwargs):
         if isinstance(msg, MessageService):
             continue
-        batch.append(await message_to_row(msg, chat_id, media_dir=media_dir, media_max_bytes=media_max_bytes))
+        row = await message_to_row(msg, chat_id, media_dir=media_dir, media_max_bytes=media_max_bytes)
+        if backfill_before is not None and msg.date < backfill_before:
+            row["backfill"] = 1
+        batch.append(row)
         if len(batch) >= 500:
-            total += db.upsert_messages(batch)
-            batch.clear()
+            total += flush()
             progress(f"  {title}: {total} сообщений…")
-    total += db.upsert_messages(batch)
+    total += flush()
     db.mark_synced(chat_id)
     return total
+
+
+async def reconcile_recent(client: TelegramClient, db: DB, entity, days: int) -> tuple[int, int]:
+    """Перечитывает последние N дней чата: подтягивает правки и отмечает удалённые сообщения,
+    сделанные, пока программа была выключена. Возвращает (обновлено, отмечено удалённых)."""
+    chat_id = utils.get_peer_id(entity)
+    since = utcnow() - timedelta(days=days)
+    rows, seen = [], set()
+    async for msg in client.iter_messages(entity, offset_date=since, reverse=True, wait_time=0.5):
+        seen.add(msg.id)
+        if isinstance(msg, MessageService):
+            continue
+        rows.append(await message_to_row(msg, chat_id))
+    if not seen:
+        return 0, 0  # ничего не вернулось — ничего не помечаем (на всякий случай)
+    # отметку synced здесь НЕ двигаем: она означает «скачано подряд», а тут только последние дни
+    updated = db.upsert_messages(rows)
+    margin = to_db(since + timedelta(minutes=5))
+    missing = db.recent_ids(chat_id, margin, max(seen)) - seen
+    deleted = db.mark_deleted(chat_id, sorted(missing)) if missing else 0
+    return updated, deleted
 
 
 def _media_args(cfg: Config) -> dict:
@@ -427,29 +538,38 @@ def _media_args(cfg: Config) -> dict:
 
 
 async def sync_chats(client: TelegramClient, db: DB, cfg: Config, chat_filter: ChatFilter,
-                     busy: set[int] | None = None) -> int:
-    """Докачивает всё новое (например, после выключения компьютера).
-
-    В режиме «все чаты» заодно находит новые чаты и скачивает их историю целиком.
-    """
+                     busy: set[int] | None = None, reconcile: bool = True) -> int:
+    """Докачивает всё новое (например, после выключения компьютера) и подтягивает правки/удаления
+    за последние дни. В режиме «все чаты» заодно находит новые чаты и скачивает их историю целиком."""
     total = 0
     targets: dict[int, object] = {}
+    recent: dict[int, object] = {}
+    window_start = utcnow() - timedelta(days=cfg.reconcile_days)
+    explicit_specs = set()
+
     if cfg.all_chats:
         async for d in client.iter_dialogs():
-            if not chat_filter.allows(d.entity, d.name):
+            explicit = db.is_explicit(d.id)
+            if chat_filter.reason_excluded(d.entity, d.name, explicit):
                 if d.id in db.monitored_chat_ids():
                     db.set_monitored(d.id, False)  # чат добавили в исключения
                 continue
+            known = db.chat_row(d.id)
+            if known is not None and not known["monitored"]:
+                db.set_monitored(d.id, True)  # чат убрали из исключений
             top = d.message.id if d.message else 0
-            if top and top <= db.last_msg_id(d.id):
-                continue  # ничего нового
-            targets[d.id] = d.entity
+            if not (top and top <= db.synced_msg_id(d.id)):
+                targets[d.id] = d.entity
+            if known is not None and d.date and d.date >= window_start:
+                recent[d.id] = d.entity
     else:
         await client.get_dialogs()  # прогреваем кеш, чтобы находить чаты по id
         entities, _ = await resolve_chats(client, cfg.chats) if cfg.chats else ([], [])
         for ent in entities:
-            if chat_filter.allows(ent):
-                targets[utils.get_peer_id(ent)] = ent
+            if chat_filter.allows(ent, explicit=True):
+                cid = utils.get_peer_id(ent)
+                targets[cid] = ent
+                explicit_specs.add(cid)
         for chat_id in db.monitored_chat_ids():
             if chat_id in targets:
                 continue
@@ -458,19 +578,21 @@ async def sync_chats(client: TelegramClient, db: DB, cfg: Config, chat_filter: C
             except Exception as e:  # noqa: BLE001
                 log.warning("Чат %s недоступен: %s", chat_id, e)
                 continue
-            if chat_filter.allows(entity):
+            if chat_filter.allows(entity, explicit=True):
                 targets[chat_id] = entity
             else:
                 db.set_monitored(chat_id, False)
+        recent = dict(targets)
 
     busy = busy if busy is not None else set()
     for chat_id, entity in targets.items():
         if chat_id in busy:
             continue  # этот чат уже скачивается
-        is_new = db.last_msg_id(chat_id) == 0
+        is_new = db.synced_msg_id(chat_id) == 0
         busy.add(chat_id)
         try:
-            n = await download_chat(client, db, entity, progress=lambda s: log.info(s), **_media_args(cfg))
+            n = await download_chat(client, db, entity, explicit=chat_id in explicit_specs,
+                                    progress=lambda s: log.info(s), **_media_args(cfg))
         except Exception as e:  # noqa: BLE001
             log.warning("Не удалось обновить чат %s: %s", chat_id, e)
             continue
@@ -479,6 +601,18 @@ async def sync_chats(client: TelegramClient, db: DB, cfg: Config, chat_filter: C
         if n:
             log.info("%s «%s»: +%s сообщений", "Новый чат" if is_new else "Докачано", display_name(entity), n)
         total += n
+
+    if reconcile and cfg.reconcile_days > 0:
+        for chat_id, entity in recent.items():
+            if chat_id in busy:
+                continue
+            try:
+                upd, deleted = await reconcile_recent(client, db, entity, cfg.reconcile_days)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Не удалось сверить чат %s: %s", chat_id, e)
+                continue
+            if deleted:
+                log.info("«%s»: отмечено удалённых сообщений: %s", display_name(entity), deleted)
     return total
 
 
@@ -511,6 +645,9 @@ def attach_live_listener(client: TelegramClient, db: DB, cfg: Config, chat_filte
         if chat_id not in db.monitored_chat_ids():
             if not cfg.all_chats or chat_id in downloading:
                 return
+            known = db.chat_row(chat_id)
+            if known is not None and not known["monitored"]:
+                return  # чат исключён настройками
             try:
                 entity = await event.get_chat()
             except Exception:  # noqa: BLE001

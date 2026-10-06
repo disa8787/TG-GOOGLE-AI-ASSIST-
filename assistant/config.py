@@ -35,6 +35,7 @@ DEFAULTS: dict = {
         "exclude_chats": [],
         "download_media": False,
         "media_max_mb": 20,
+        "reconcile_days": 3,
     },
     "privacy": {
         "mask_card_numbers": True,
@@ -154,6 +155,7 @@ class Config:
     exclude_chats: list
     download_media: bool
     media_max_mb: int
+    reconcile_days: int
     mask_cards: bool
 
     # Google
@@ -267,6 +269,7 @@ def load_config(root: Path = ROOT) -> Config:
         exclude_chats=exclude,
         download_media=bool(tg.get("download_media")),
         media_max_mb=int(tg.get("media_max_mb") or 20),
+        reconcile_days=max(0, int(tg.get("reconcile_days", 3) or 0)),
         mask_cards=bool((raw.get("privacy") or {}).get("mask_card_numbers", True)),
         google_auth=str(gg.get("auth") or "service_account"),
         google_credentials=cred,

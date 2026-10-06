@@ -11,8 +11,9 @@ from croniter import croniter
 
 from .brain import Assistant
 from .config import WEEKDAY_KEYS
-from .learn import build_profile, learn_history
-from .llm import LLMError
+from .learn import build_profile, learn_history, nightly_scope
+from .llm import LLMError, estimate_cost
+from .telegram_archive import ChatFilter
 from .util import fmt_local, from_db, utcnow
 
 log = logging.getLogger(__name__)
@@ -132,15 +133,37 @@ class Scheduler:
         return utcnow() - from_db(built) >= timedelta(days=self.cfg.profile_rebuild_days)
 
     async def nightly_once(self) -> None:
-        """Изучает всё новое за день (в память) и раз в несколько дней обновляет профиль."""
+        """Изучает новое за день (в память) и раз в несколько дней обновляет профиль.
+
+        Без подтверждения изучаются только чаты, уже одобренные ручным learn, и небольшие новые чаты.
+        О крупной неизученной истории (например, добавили в группу с годами переписки) — сообщаем владельцу.
+        """
         say = log.info
         if not self.db.learning_started():
             say("Ночное изучение пропущено: сначала запусти «assistant learn» (там видна стоимость).")
             return
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        eligible, deferred = nightly_scope(self.asst)
         ok = await learn_history(self.asst, None, self.cfg.model, yes=True, say=say,
-                                 max_chunks=self.cfg.nightly_max_chunks)
+                                 max_chunks=self.cfg.nightly_max_chunks, only_chats=eligible)
         if ok and self.profile_due():
             await build_profile(self.asst, self.cfg.model, say=say)
+        await self._report_backlog(deferred)
+
+    async def _report_backlog(self, deferred: list[tuple[str, int, int]]) -> None:
+        key = ";".join(sorted(t for t, _, _ in deferred))
+        if not deferred or self.db.get_kv("backlog_reported") == key:
+            return
+        messages = sum(n for _, n, _ in deferred)
+        chars = sum(c for _, _, c in deferred)
+        cost = estimate_cost(self.cfg.model, int(chars / 2.5), int(chars / 2.5 / 10))
+        names = ", ".join(f"«{t}» ({n})" for t, n, _ in deferred[:10])
+        more = f" и ещё {len(deferred) - 10}" if len(deferred) > 10 else ""
+        await self._safe_notify(
+            f"📚 Есть неизученная история: {messages} сообщений в чатах {names}{more}. "
+            f"Без твоего согласия я её не изучаю (≈ ${cost:.2f}). Изучить: assistant learn"
+        )
+        self.db.set_kv("backlog_reported", key)
 
     async def nightly_loop(self) -> None:
         while True:
