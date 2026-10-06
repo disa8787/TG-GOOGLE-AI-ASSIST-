@@ -13,21 +13,27 @@ from .config import Config
 from .jobs import Scheduler
 from .llm import LLMError
 from .telegram_archive import (
+    ChatFilter,
     attach_live_listener,
     connect_user,
     forward_name,
-    sync_monitored,
+    sync_chats,
 )
-from .util import fmt_local, split_text
+from .util import fmt_local, split_text, utcnow
 
 log = logging.getLogger(__name__)
 
 HELP = """\
-Я твой ИИ-ассистент. Пиши вопросы обычным текстом, например:
+Я — твой «второй я»: знаю всё из твоего Telegram, таблиц и памяти и ничего не забываю. \
+От твоего имени я ничего не пишу — твой Telegram для меня только на чтение.
+
+Пиши вопросы обычным текстом, например:
 • Где сейчас Иван и когда он выгружается?
 • Кто освобождается завтра и где?
+• Что я обещал Марии на прошлой неделе?
+• Кто ждёт от меня ответа?
 • Напомни в 15:00 запросить апдейт у Сергея
-• Что писал брокер по грузу 12345 на прошлой неделе?
+• Набросай ответ брокеру по грузу 12345 — как бы написал я
 • Запомни: у Петра трак 512, он не ездит в Нью-Йорк
 
 Можно присылать фото и PDF (рейт-коны, BOL, скриншоты) и пересылать сообщения из чатов.
@@ -86,7 +92,7 @@ async def read_attachments(bot: TelegramClient, msg) -> tuple[list[dict], list[s
 
 
 def register_bot_handlers(bot: TelegramClient, user: TelegramClient, asst: Assistant, sched: Scheduler,
-                          owner_id: int) -> None:
+                          owner_id: int, chat_filter: ChatFilter, busy: set[int]) -> None:
     cfg = asst.cfg
 
     async def run_with_typing(chat_id, coro):
@@ -132,7 +138,7 @@ def register_bot_handlers(bot: TelegramClient, user: TelegramClient, asst: Assis
                 asst.reset_dialog()
                 await send(bot, chat_id, "Ок, начинаем с чистого листа. Память и архив на месте.")
             elif cmd == "/sync":
-                n = await run_with_typing(chat_id, sync_monitored(user, asst.db, cfg))
+                n = await run_with_typing(chat_id, sync_chats(user, asst.db, cfg, chat_filter, busy))
                 await send(bot, chat_id, f"Готово, новых сообщений: {n}")
             elif cmd == "/status":
                 await send(bot, chat_id, asst.status_text())
@@ -154,44 +160,57 @@ def register_bot_handlers(bot: TelegramClient, user: TelegramClient, asst: Assis
             await send(bot, chat_id, f"⚠️ Что-то пошло не так: {type(e).__name__}: {e}")
 
 
+def _append_notification(cfg: Config, text: str) -> None:
+    with open(cfg.data_dir / "notifications.log", "a", encoding="utf-8") as f:
+        f.write(f"\n----- {fmt_local(utcnow(), cfg.tz)}\n{text}\n")
+
+
 async def run_app(cfg: Config) -> None:
     asst = Assistant(cfg)
-    user = await connect_user(cfg)
+    user = await connect_user(cfg, asst.db)  # аккаунт владельца — только чтение
     me = await user.get_me()
     owner_id = cfg.owner_id or me.id
-
-    ignored: set[int] = set()
-    for spec in cfg.ignore_chats:
-        ignored.update(asst.db.find_chat_ids(spec) or [])
-    if cfg.bot_id:
-        ignored.add(cfg.bot_id)
+    chat_filter = ChatFilter(cfg, asst.db)
+    chat_filter.apply_to_db(asst.db)
+    busy: set[int] = set()  # чаты, история которых сейчас скачивается
 
     bot: TelegramClient | None = None
     if cfg.bot_token:
         bot = TelegramClient(str(cfg.data_dir / "bot"), cfg.api_id, cfg.api_hash)
         await bot.start(bot_token=cfg.bot_token)
     else:
-        log.warning("BOT_TOKEN не задан — уведомления будут приходить в «Избранное» твоего Telegram.")
+        log.warning("BOT_TOKEN не задан — уведомления будут только в этом окне и в data/notifications.log. "
+                    "От имени твоего аккаунта ассистент не пишет никогда.")
 
     async def notify(text: str) -> None:
         if bot is not None:
             await send(bot, owner_id, text)
-        else:
-            await send(user, "me", text)
+            return
+        print("\n" + text + "\n", flush=True)
+        _append_notification(cfg, text)
 
-    print("Докачиваю новые сообщения из отслеживаемых чатов…", flush=True)
-    new = await sync_monitored(user, asst.db, cfg)
-    attach_live_listener(user, asst.db, cfg, ignored)
-
-    sched = Scheduler(asst, notify, ignored)
+    # слушаем сразу, чтобы не пропустить сообщения, пока докачивается история
+    attach_live_listener(user, asst.db, cfg, chat_filter, busy)
+    sched = Scheduler(asst, notify, set())
     if bot is not None:
-        register_bot_handlers(bot, user, asst, sched, owner_id)
-    tasks = sched.tasks()
+        register_bot_handlers(bot, user, asst, sched, owner_id, chat_filter, busy)
 
-    print(f"✅ Ассистент запущен. Новых сообщений докачано: {new}.")
+    async def initial_sync() -> None:
+        try:
+            new = await sync_chats(user, asst.db, cfg, chat_filter, busy)
+            log.info("Синхронизация завершена: новых сообщений %s", new)
+            if new:
+                await notify(f"🔄 Докачал пропущенное: {new} новых сообщений.")
+        except Exception:  # noqa: BLE001
+            log.exception("Ошибка синхронизации чатов")
+
+    tasks = sched.tasks() + [asyncio.create_task(initial_sync(), name="initial-sync")]
+
+    mode = "все чаты" if cfg.all_chats else f"{len(cfg.chats)} выбранных чатов"
+    print(f"✅ Ассистент запущен ({mode}, Telegram — только чтение). Докачиваю пропущенное в фоне…")
     print("Пиши боту в Telegram. Для остановки закрой это окно или нажми Ctrl+C.")
     try:
-        await notify(f"✅ Ассистент запущен. Докачано новых сообщений: {new}. /help — что я умею.")
+        await notify("✅ Ассистент запущен. /help — что я умею.")
     except Exception:  # noqa: BLE001
         log.warning("Не удалось отправить приветствие. Владелец должен сначала нажать /start у бота.")
 

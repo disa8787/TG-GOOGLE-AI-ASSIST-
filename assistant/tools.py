@@ -12,11 +12,13 @@ from croniter import croniter
 from .config import Config
 from .db import DB
 from .sheets import Sheets, diff_tables, format_table
-from .util import fmt_local, parse_local, to_db, truncate, utcnow
+from .util import fmt_local, mask_cards, parse_local, to_db, truncate, utcnow
 
 log = logging.getLogger(__name__)
 
 MAX_RESULT_CHARS = 40000
+
+OWNER_WORDS = {"я", "me", "владелец", "owner"}
 
 DATE_HINT = "Формат: 'YYYY-MM-DD' или 'YYYY-MM-DD HH:MM' (местное время владельца)."
 
@@ -37,7 +39,8 @@ TOOL_SCHEMAS: list[dict] = [
                 "mode": {"type": "string", "enum": ["all", "any"],
                          "description": "all — все слова (по умолчанию), any — хотя бы одно."},
                 "chat": {"type": "string", "description": "Ограничить чатом: id или часть названия."},
-                "sender": {"type": "string", "description": "Часть имени автора."},
+                "sender": {"type": "string",
+                           "description": "Часть имени автора. «Я» — только сообщения самого владельца."},
                 "date_from": {"type": "string", "description": DATE_HINT},
                 "date_to": {"type": "string", "description": DATE_HINT},
                 "limit": {"type": "integer",
@@ -190,6 +193,21 @@ TOOL_SCHEMAS: list[dict] = [
             },
         },
     },
+    {
+        "name": "search_conversations",
+        "description": (
+            "Поиск по прошлым разговорам владельца с тобой (ассистентом) и по твоим отчётам/уведомлениям — "
+            "«что я тебе говорил про …», «что ты писал в отчёте про …»."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Слова для поиска."},
+                "limit": {"type": "integer", "description": "Сколько записей (по умолчанию 20)."},
+            },
+            "required": ["query"],
+        },
+    },
 ]
 
 
@@ -248,12 +266,18 @@ class ToolBox:
             raise ToolError(f"чат «{chat}» не найден в архиве. Список: list_chats")
         return ids
 
+    def _clean(self, text: str) -> str:
+        return mask_cards(text) if self.cfg.mask_cards else text
+
     def format_messages(self, rows) -> str:
+        """Сообщения → текст для модели. Сообщения владельца подписаны «Я»."""
         titles = self.db.chat_titles()
+        edits = self.db.edits_for([r["id"] for r in rows if r["edited_at"]])
         lines = []
         for r in rows:
+            author = "Я" if r["outgoing"] else (r["sender_name"] or r["sender_id"] or "?")
             parts = [f"[{fmt_local(r['date'], self.cfg.tz)}]", f"«{titles.get(r['chat_id'], r['chat_id'])}»",
-                     f"#{r['msg_id']}", f"{r['sender_name'] or r['sender_id'] or '?'}:"]
+                     f"#{r['msg_id']}", f"{author}:"]
             body = []
             if r["fwd_from"]:
                 body.append(f"(переслано от {r['fwd_from']})")
@@ -262,17 +286,25 @@ class ToolBox:
             if r["media"]:
                 body.append(r["media"])
             if r["text"]:
-                body.append(r["text"])
-            if r["edited_at"]:
+                body.append(self._clean(r["text"]))
+            old = edits.get(r["id"])
+            if old:
+                body.append("(изменено; было: " + " → ".join(f"«{self._clean(t)}»" for t in old) + ")")
+            elif r["edited_at"]:
                 body.append("(изм.)")
+            if r["deleted_at"]:
+                body.append(f"(УДАЛЕНО в Telegram {fmt_local(r['deleted_at'], self.cfg.tz)})")
             lines.append(" ".join(parts + body))
         return "\n".join(lines)
 
     # ------------------------------------------------------------------ Telegram-архив
     def t_search_messages(self, query: str, mode: str = "all", chat: str | None = None, sender: str | None = None,
                           date_from: str | None = None, date_to: str | None = None, limit: int = 40) -> str:
+        outgoing = None
+        if sender and sender.strip().lower() in OWNER_WORDS:
+            sender, outgoing = None, True
         rows = self.db.search_messages(
-            query, mode=mode, chat_ids=self._chat_ids(chat), sender=sender,
+            query, mode=mode, chat_ids=self._chat_ids(chat), sender=sender, outgoing=outgoing,
             date_from=self._date(date_from), date_to=self._date(date_to, end=True),
             limit=max(1, min(int(limit), 200)),
         )
@@ -420,4 +452,15 @@ class ToolBox:
             return "Отчётов за этот период нет."
         return "\n\n".join(
             f"=== {r['kind']} {fmt_local(r['created_at'], self.cfg.tz)} ===\n{r['content']}" for r in rows
+        )
+
+    def t_search_conversations(self, query: str, limit: int = 20) -> str:
+        rows = self.db.search_conversations(query, limit=max(1, min(int(limit), 100)))
+        if not rows:
+            return "В прошлых разговорах и отчётах ничего не найдено."
+        names = {"user": "Владелец", "assistant": "Ассистент", "daily": "Отчёт", "watch": "Уведомление"}
+        return "\n\n".join(
+            f"[{fmt_local(r['created_at'], self.cfg.tz)}] {names.get(r['kind'], r['kind'])}: "
+            f"{truncate(r['content'], 3000)}"
+            for r in rows
         )

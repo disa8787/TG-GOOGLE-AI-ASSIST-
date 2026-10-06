@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -71,3 +72,32 @@ def truncate(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n…[обрезано: показано {limit} из {len(text)} символов]"
+
+
+CARD_RE = re.compile(r"(?<![\d-])(?:\d[ -]?){12,18}\d(?![\d-])")
+
+
+def _luhn_ok(digits: str) -> bool:
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = int(ch)
+        if i % 2:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def mask_cards(text: str) -> str:
+    """Прячет номера банковских карт (13–19 цифр, проходят проверку Луна): «[карта ****1234]»."""
+    if not text or not any(ch.isdigit() for ch in text):
+        return text
+
+    def repl(m: re.Match) -> str:
+        digits = re.sub(r"\D", "", m.group(0))
+        if 13 <= len(digits) <= 19 and _luhn_ok(digits):
+            return f"[карта ****{digits[-4:]}]"
+        return m.group(0)
+
+    return CARD_RE.sub(repl, text)

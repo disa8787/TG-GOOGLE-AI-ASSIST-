@@ -84,7 +84,10 @@ class Assistant:
         sheets = "\n".join(
             f"• {s.name}" + (f" — {s.description}" if s.description else "") for s in self.cfg.sheets
         ) or "(не настроены)"
+        name = self.db.get_kv("owner_name") or "имя пока неизвестно (выполни login/download)"
+        owner = f"{name}. В архиве его сообщения подписаны «Я»."
         return KNOWLEDGE_TEMPLATE.format(
+            owner=owner,
             profile=self.profile() or NO_PROFILE,
             sheets=sheets,
             count=self.db.memory_count(),
@@ -209,7 +212,8 @@ class Assistant:
         lines = [
             f"Архив: {st['n']} сообщений в {len(chats)} чатах "
             f"({fmt_local(st['first'], self.cfg.tz)[:10]} … {fmt_local(st['last'], self.cfg.tz)})",
-            f"Отслеживаются: {sum(1 for c in chats if c['monitored'])} чатов",
+            f"Отслеживаются: {sum(1 for c in chats if c['monitored'])} чатов"
+            + (" (режим «все чаты»: новые подключаются сами)" if self.cfg.all_chats else ""),
             f"Память: {self.db.memory_count()} заметок; профиль работы: "
             + ("есть" if self.profile() else "нет (запусти learn)"),
             f"Таблиц настроено: {len(self.cfg.sheets)}",

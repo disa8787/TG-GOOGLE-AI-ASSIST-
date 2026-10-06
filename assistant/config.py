@@ -28,10 +28,22 @@ DEFAULT_REPORT_INSTRUCTIONS = """\
 DEFAULTS: dict = {
     "timezone": "",
     "telegram": {
-        "chats": [],
-        "ignore_chats": [],
+        "chats": "all",
+        "include_channels": False,
+        "include_bots": False,
+        "include_saved_messages": True,
+        "exclude_chats": [],
         "download_media": False,
         "media_max_mb": 20,
+    },
+    "privacy": {
+        "mask_card_numbers": True,
+    },
+    "learn": {
+        "nightly": True,
+        "time": "03:30",
+        "profile_rebuild_days": 7,
+        "nightly_max_chunks": 20,
     },
     "google": {
         "auth": "service_account",
@@ -92,6 +104,21 @@ def _hm(value, default: str) -> str:
     return text
 
 
+ALL_WORDS = {"all", "все", "всё", "*"}
+
+
+def _chat_selection(value) -> tuple[bool, list]:
+    """chats: all → (True, []); chats: [список] → (False, список). Пустой список тоже значит «все»."""
+    if value is None:
+        return True, []
+    if isinstance(value, str):
+        return (True, []) if value.strip().lower() in ALL_WORDS else (False, [value])
+    items = [v for v in value if v is not None and str(v).strip()]
+    if not items or any(str(v).strip().lower() in ALL_WORDS for v in items):
+        return True, []
+    return False, items
+
+
 def _local_tz_name() -> str:
     tz = datetime.now().astimezone().tzinfo
     return getattr(tz, "key", None) or "UTC"
@@ -119,10 +146,15 @@ class Config:
     phone: str | None
     bot_token: str | None
     owner_id: int | None
+    all_chats: bool
     chats: list
-    ignore_chats: list
+    include_channels: bool
+    include_bots: bool
+    include_saved: bool
+    exclude_chats: list
     download_media: bool
     media_max_mb: int
+    mask_cards: bool
 
     # Google
     google_auth: str
@@ -153,6 +185,10 @@ class Config:
     memory_max_chars: int
     dialog_messages: int
     learn_chunk_chars: int
+    nightly_learn: bool
+    nightly_time: str
+    profile_rebuild_days: int
+    nightly_max_chunks: int
 
     @property
     def bot_id(self) -> int | None:
@@ -184,7 +220,10 @@ def load_config(root: Path = ROOT) -> Config:
     data_dir.mkdir(exist_ok=True)
 
     tg, gg, cl = raw["telegram"], raw["google"], raw["claude"]
-    rep, watch, mem = raw["report"], raw["watch"], raw["memory"]
+    rep, watch, mem, lrn = raw["report"], raw["watch"], raw["memory"], raw["learn"]
+    all_chats, chat_specs = _chat_selection(tg.get("chats"))
+    # ignore_chats — старое имя настройки, понимаем и его
+    exclude = list(tg.get("exclude_chats") or []) + list(tg.get("ignore_chats") or [])
 
     api_id = os.getenv("TG_API_ID", "").strip()
     owner = os.getenv("OWNER_ID", "").strip()
@@ -220,10 +259,15 @@ def load_config(root: Path = ROOT) -> Config:
         phone=os.getenv("TG_PHONE", "").strip() or None,
         bot_token=os.getenv("BOT_TOKEN", "").strip() or None,
         owner_id=int(owner) if owner.lstrip("-").isdigit() else None,
-        chats=list(tg.get("chats") or []),
-        ignore_chats=list(tg.get("ignore_chats") or []),
+        all_chats=all_chats,
+        chats=chat_specs,
+        include_channels=bool(tg.get("include_channels")),
+        include_bots=bool(tg.get("include_bots")),
+        include_saved=bool(tg.get("include_saved_messages", True)),
+        exclude_chats=exclude,
         download_media=bool(tg.get("download_media")),
         media_max_mb=int(tg.get("media_max_mb") or 20),
+        mask_cards=bool((raw.get("privacy") or {}).get("mask_card_numbers", True)),
         google_auth=str(gg.get("auth") or "service_account"),
         google_credentials=cred,
         sheets=sheets,
@@ -246,4 +290,8 @@ def load_config(root: Path = ROOT) -> Config:
         memory_max_chars=int(mem.get("max_prompt_chars") or 40000),
         dialog_messages=int(mem.get("dialog_messages") or 20),
         learn_chunk_chars=int(mem.get("learn_chunk_chars") or 120000),
+        nightly_learn=bool(lrn.get("nightly", True)),
+        nightly_time=_hm(lrn.get("time"), "03:30"),
+        profile_rebuild_days=max(1, int(lrn.get("profile_rebuild_days") or 7)),
+        nightly_max_chunks=max(1, int(lrn.get("nightly_max_chunks") or 20)),
     )

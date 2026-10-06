@@ -11,6 +11,7 @@ from croniter import croniter
 
 from .brain import Assistant
 from .config import WEEKDAY_KEYS
+from .learn import build_profile, learn_history
 from .llm import LLMError
 from .util import fmt_local, from_db, utcnow
 
@@ -39,6 +40,7 @@ class Scheduler:
             asyncio.create_task(self.reminders_loop(), name="reminders"),
             asyncio.create_task(self.report_loop(), name="report"),
             asyncio.create_task(self.watch_loop(), name="watch"),
+            asyncio.create_task(self.nightly_loop(), name="nightly-learn"),
         ]
 
     # ------------------------------------------------------------------ напоминания
@@ -113,6 +115,43 @@ class Scheduler:
             except Exception:  # noqa: BLE001
                 log.exception("Ошибка фоновой проверки")
             await asyncio.sleep(self.cfg.watch_interval * 60)
+
+    # ------------------------------------------------------------------ ночное дообучение
+    def nightly_due(self) -> bool:
+        if not self.cfg.nightly_learn:
+            return False
+        now = datetime.now(self.cfg.tz)
+        if now.time() < _parse_hm(self.cfg.nightly_time):
+            return False
+        return self.db.get_kv("last_nightly_date") != now.date().isoformat()
+
+    def profile_due(self) -> bool:
+        built = self.db.get_kv("profile_built_at")
+        if not built:
+            return True
+        return utcnow() - from_db(built) >= timedelta(days=self.cfg.profile_rebuild_days)
+
+    async def nightly_once(self) -> None:
+        """Изучает всё новое за день (в память) и раз в несколько дней обновляет профиль."""
+        say = log.info
+        if not self.db.learning_started():
+            say("Ночное изучение пропущено: сначала запусти «assistant learn» (там видна стоимость).")
+            return
+        ok = await learn_history(self.asst, None, self.cfg.model, yes=True, say=say,
+                                 max_chunks=self.cfg.nightly_max_chunks)
+        if ok and self.profile_due():
+            await build_profile(self.asst, self.cfg.model, say=say)
+
+    async def nightly_loop(self) -> None:
+        while True:
+            try:
+                if self.nightly_due():
+                    self.db.set_kv("last_nightly_date", datetime.now(self.cfg.tz).date().isoformat())
+                    log.info("Ночное изучение новых сообщений…")
+                    await self.nightly_once()
+            except Exception:  # noqa: BLE001
+                log.exception("Ошибка ночного изучения")
+            await asyncio.sleep(60)
 
     async def _safe_notify(self, text: str) -> None:
         try:

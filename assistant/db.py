@@ -37,10 +37,21 @@ CREATE TABLE IF NOT EXISTS messages(
     media       TEXT,
     media_path  TEXT,
     edited_at   TEXT,
+    outgoing    INTEGER NOT NULL DEFAULT 0,
+    deleted_at  TEXT,
     UNIQUE(chat_id, msg_id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_date ON messages(chat_id, date);
 CREATE INDEX IF NOT EXISTS idx_messages_date ON messages(date);
+
+-- старые версии отредактированных сообщений: ассистент ничего не забывает
+CREATE TABLE IF NOT EXISTS message_edits(
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    old_text   TEXT NOT NULL,
+    saved_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_message_edits ON message_edits(message_id);
 
 CREATE TABLE IF NOT EXISTS memory(
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,10 +138,26 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF text, sender_name ON me
 END;
 """
 
+EDIT_TRIGGER = """
+CREATE TRIGGER IF NOT EXISTS messages_keep_edits AFTER UPDATE OF text ON messages
+WHEN old.text <> new.text AND old.text <> '' BEGIN
+    INSERT INTO message_edits(message_id, old_text, saved_at)
+    VALUES (old.id, old.text, strftime('%Y-%m-%d %H:%M:%S', 'now'));
+END;
+"""
+
 MESSAGE_COLUMNS = (
     "chat_id", "msg_id", "date", "sender_id", "sender_name", "text",
-    "reply_to", "fwd_from", "media", "media_path", "edited_at",
+    "reply_to", "fwd_from", "media", "media_path", "edited_at", "outgoing",
 )
+
+# Сообщения в личках и обычных группах имеют сквозную нумерацию по аккаунту,
+# у каналов и супергрупп (id вида -100…) — своя нумерация внутри канала.
+CHANNEL_ID_LIMIT = -1_000_000_000_000
+
+
+def _ulower(value):
+    return value.lower() if isinstance(value, str) else value
 
 
 def subject_key(subject: str) -> str:
@@ -142,12 +169,25 @@ class DB:
         self.path = path
         self.conn = sqlite3.connect(str(path), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # встроенный lower() в SQLite понимает только латиницу — для кириллицы нужен питоновский
+        self.conn.create_function("ulower", 1, _ulower, deterministic=True)
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+        self.conn.executescript(EDIT_TRIGGER)
         self._init_fts()
 
     # ------------------------------------------------------------------ служебное
+    def _migrate(self) -> None:
+        """Добавляет новые колонки в базы, созданные прошлыми версиями."""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(messages)")}
+        with self.conn:
+            if "outgoing" not in cols:
+                self.conn.execute("ALTER TABLE messages ADD COLUMN outgoing INTEGER NOT NULL DEFAULT 0")
+            if "deleted_at" not in cols:
+                self.conn.execute("ALTER TABLE messages ADD COLUMN deleted_at TEXT")
+
     def _init_fts(self) -> None:
         exists = self.conn.execute(
             "SELECT 1 FROM sqlite_master WHERE name='messages_fts'"
@@ -257,19 +297,48 @@ class DB:
             f"INSERT INTO messages({cols}) VALUES({marks}) "
             f"ON CONFLICT(chat_id, msg_id) DO UPDATE SET {updates}"
         )
+        defaults = {"text": "", "outgoing": 0}
         values = [
-            tuple((r.get(c) or "") if c == "text" else r.get(c) for c in MESSAGE_COLUMNS) for r in rows
+            tuple(r.get(c) if r.get(c) is not None else defaults.get(c) for c in MESSAGE_COLUMNS) for r in rows
         ]
         with self.conn:
             self.conn.executemany(sql, values)
         return len(rows)
 
-    def delete_messages(self, chat_id: int | None, msg_ids: list[int]) -> None:
+    def mark_deleted(self, chat_id: int | None, msg_ids: list[int]) -> int:
+        """Сообщение удалили в Telegram — в архиве оно остаётся, но с пометкой «удалено»."""
+        if not msg_ids:
+            return 0
+        now = to_db(utcnow())
+        marks = ",".join("?" * len(msg_ids))
         with self.conn:
-            for mid in msg_ids:
-                if chat_id is None:
-                    continue
-                self.conn.execute("DELETE FROM messages WHERE chat_id=? AND msg_id=?", (chat_id, mid))
+            if chat_id is not None:
+                cur = self.conn.execute(
+                    f"UPDATE messages SET deleted_at=? WHERE deleted_at IS NULL AND chat_id=? AND msg_id IN ({marks})",
+                    (now, chat_id, *msg_ids),
+                )
+            else:
+                cur = self.conn.execute(
+                    f"UPDATE messages SET deleted_at=? WHERE deleted_at IS NULL AND chat_id > ? "
+                    f"AND msg_id IN ({marks})",
+                    (now, CHANNEL_ID_LIMIT, *msg_ids),
+                )
+        return cur.rowcount
+
+    def edits_for(self, message_ids: list[int]) -> dict[int, list[str]]:
+        if not message_ids:
+            return {}
+        out: dict[int, list[str]] = {}
+        for start in range(0, len(message_ids), 500):
+            part = message_ids[start:start + 500]
+            rows = self.conn.execute(
+                f"SELECT message_id, old_text FROM message_edits WHERE message_id IN ({','.join('?' * len(part))}) "
+                "ORDER BY id",
+                part,
+            ).fetchall()
+            for r in rows:
+                out.setdefault(r["message_id"], []).append(r["old_text"])
+        return out
 
     def _fts_query(self, query: str, mode: str) -> str | None:
         words = [w for w in re.findall(r"\w+", query.lower()) if len(w) >= 3]
@@ -289,6 +358,7 @@ class DB:
         date_from: str | None = None,
         date_to: str | None = None,
         limit: int = 40,
+        outgoing: bool | None = None,
     ) -> list[sqlite3.Row]:
         where, params = [], []
         match = self._fts_query(query, mode)
@@ -299,14 +369,17 @@ class DB:
         else:
             base = "SELECT m.* FROM messages m"
             if query.strip():
-                where.append("lower(m.text) LIKE ?")
+                where.append("ulower(m.text) LIKE ?")
                 params.append(f"%{query.strip().lower()}%")
         if chat_ids is not None:
             where.append(f"m.chat_id IN ({','.join('?' * len(chat_ids)) or 'NULL'})")
             params.extend(chat_ids)
         if sender:
-            where.append("lower(coalesce(m.sender_name,'')) LIKE ?")
+            where.append("ulower(coalesce(m.sender_name,'')) LIKE ?")
             params.append(f"%{sender.lower()}%")
+        if outgoing is not None:
+            where.append("m.outgoing = ?")
+            params.append(1 if outgoing else 0)
         if date_from:
             where.append("m.date >= ?")
             params.append(date_from)
@@ -484,6 +557,21 @@ class DB:
         ).fetchall()
         return list(reversed(rows))
 
+    def search_conversations(self, query: str, limit: int = 30) -> list[dict]:
+        """Поиск по прошлым разговорам владельца с ассистентом и по отчётам/уведомлениям."""
+        words = [w for w in re.findall(r"\w+", query.lower()) if len(w) >= 2] or [query.lower().strip()]
+        found: list[dict] = []
+        for table, kind_sql in (("dialog", "role"), ("reports", "kind")):
+            where = " AND ".join("ulower(content) LIKE ?" for _ in words)
+            rows = self.conn.execute(
+                f"SELECT {kind_sql} AS kind, content, created_at FROM {table} WHERE {where} "
+                "ORDER BY created_at DESC LIMIT ?",
+                [*(f"%{w}%" for w in words), limit],
+            ).fetchall()
+            found.extend(dict(r) for r in rows)
+        found.sort(key=lambda r: r["created_at"], reverse=True)
+        return found[:limit]
+
     def last_dialog_id(self) -> int:
         row = self.conn.execute("SELECT max(id) AS m FROM dialog").fetchone()
         return int(row["m"] or 0)
@@ -539,6 +627,9 @@ class DB:
 
     def learn_notes(self) -> list[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM learn_notes ORDER BY chat_id, period, id").fetchall()
+
+    def learning_started(self) -> bool:
+        return self.conn.execute("SELECT 1 FROM kv WHERE key LIKE 'learn_cursor:%' LIMIT 1").fetchone() is not None
 
     def reset_learning(self) -> None:
         with self.conn:
