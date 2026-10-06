@@ -16,7 +16,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from telethon import TelegramClient, events, utils
+from telethon import TelegramClient, events, functions, utils
 from telethon.tl.custom.message import Message
 from telethon.tl.types import (
     Channel,
@@ -353,14 +353,21 @@ class ChatFilter:
                 self.excluded_ids.update(ids)
             for chat_id, title in db.chat_titles().items():
                 if (title or "").lower() in self.excluded_names:
-                    self._remember_name((title or "").lower(), chat_id)
+                    self.excluded_ids.add(chat_id)  # только на этот запуск: название в базе может быть устаревшим
             self._migrated = {k: [int(i) for i in v] for k, v in _load_json(db.get_kv("excluded_migrated")).items()}
             for src, ids in self._migrated.items():
                 if self._id_excluded(int(src)):
                     self.excluded_ids.update(ids)
             if not cfg.all_chats:
+                resolved = _load_json(db.get_kv("listed_resolved_ids"))
                 for spec in cfg.chats:
                     self.listed_ids.update(db.match_chat_ids(spec))
+                    self.listed_ids.update(int(i) for i in resolved.get(str(spec).strip(), []))
+                if db.get_kv("list_explicit_migrated") is None:
+                    # прошлые версии помечали чаты из списка «явными» — тогда их нельзя было убрать из списка
+                    for cid in self.listed_ids:
+                        db.set_explicit(cid, False)
+                    db.set_kv("list_explicit_migrated", "1")
 
     # ------------------------------------------------------------------ запоминание исключений
     def _remember_name(self, name: str, peer_id: int) -> None:
@@ -379,22 +386,28 @@ class ChatFilter:
         migrated = getattr(entity, "migrated_to", None)
         if not isinstance(entity, Chat) or migrated is None or not hasattr(migrated, "channel_id"):
             return
-        src = utils.get_peer_id(entity)
-        title = (name or display_name(entity) or "").lower()
-        if not (self._id_excluded(src) or (title and title in self.excluded_names)):
-            return
-        new_id = utils.get_peer_id(PeerChannel(migrated.channel_id))
-        self.excluded_ids.add(new_id)
-        ids = self._migrated.setdefault(str(src), [])
-        if new_id not in ids:
-            ids.append(new_id)
+        self.note_migration_ids(utils.get_peer_id(entity), utils.get_peer_id(PeerChannel(migrated.channel_id)),
+                                name or display_name(entity))
+
+    def note_migration_ids(self, src_peer: int, new_peer: int, db_title: str | None = None) -> bool:
+        """Супергруппа new_peer — продолжение группы src_peer. Если старая исключена — исключаем и новую."""
+        title = (db_title or "").lower()
+        if not (self._id_excluded(src_peer) or (title and title in self.excluded_names)):
+            return False
+        self.excluded_ids.add(new_peer)
+        ids = self._migrated.setdefault(str(src_peer), [])
+        if new_peer not in ids:
+            ids.append(new_peer)
             if self.db is not None:
                 self.db.set_kv("excluded_migrated", json.dumps(self._migrated))
+        return True
 
     # ------------------------------------------------------------------ проверки
-    def _listed(self, peer_id: int, raw_id: int | None, username: str, title: str) -> bool:
+    def _listed(self, peer_id: int, raw_id: int | None, username: str, title: str, live: bool = False) -> bool:
+        """live=True — название получено из Telegram прямо сейчас: тогда связь «название → чат» запоминается."""
         if bool(title) and title in self.excluded_names:
-            self._remember_name(title, peer_id)
+            if live:
+                self._remember_name(title, peer_id)
             return True
         return (
             peer_id in self.excluded_ids or (raw_id is not None and raw_id in self.excluded_ids)
@@ -424,7 +437,7 @@ class ChatFilter:
         except Exception:  # noqa: BLE001
             return "неизвестный тип чата"
         title = (name or display_name(entity) or "").lower()
-        if self._listed(peer_id, raw_id, username, title):
+        if self._listed(peer_id, raw_id, username, title, live=True):
             return "в списке exclude_chats"
         if explicit or peer_id in self.listed_ids:
             return None
@@ -459,7 +472,7 @@ class ChatFilter:
             changed += 1
             if not want:
                 db.set_kv("profile_built_at", None)  # профиль пересоберётся без исключённого
-            elif c["last_sync"] and not c["backfill_before"]:
+            elif c["last_sync"]:
                 # чат вернулся: всё, что пришло, пока он был исключён, — не «новое» для фоновой проверки
                 db.set_backfill_before(c["chat_id"], to_db(utcnow() - BACKFILL_GRACE))
         return changed
@@ -473,12 +486,14 @@ def _load_json(value: str | None) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-async def resolve_chats(client: TelegramClient, specs: list):
-    """Находит чаты по id / @username / части названия. Возвращает (entities, not_found)."""
+async def resolve_chats(client: TelegramClient, specs: list, mapping: dict | None = None):
+    """Находит чаты по id / @username / части названия. Возвращает (entities, not_found).
+    mapping (если передан) заполняется: запись списка → id найденных чатов (включая супергруппу-продолжение)."""
     dialogs = [d async for d in client.iter_dialogs()]
     found, missing = {}, []
     for spec in specs:
         text = str(spec).strip()
+        ids: list[int] = []
         matches = []
         if text.lstrip("-").isdigit():
             num = int(text)
@@ -489,15 +504,16 @@ async def resolve_chats(client: TelegramClient, specs: list):
             if not matches:
                 try:
                     ent = await client.get_entity(text)
-                    found[utils.get_peer_id(ent)] = ent
-                    continue
+                    pid = utils.get_peer_id(ent)
+                    found[pid] = ent
+                    ids.append(pid)
                 except Exception:
-                    matches = []
+                    pass
         else:
             needle = text.lower()
             exact = [d for d in dialogs if (d.name or "").lower() == needle]
             matches = exact or [d for d in dialogs if needle in (d.name or "").lower()]
-        if not matches:
+        if not matches and not ids:
             missing.append(text)
         for d in matches:
             ent = d.entity
@@ -506,11 +522,16 @@ async def resolve_chats(client: TelegramClient, specs: list):
                 # обычная группа превратилась в супергруппу — дальше переписка идёт там
                 try:
                     new = await client.get_entity(migrated)
-                    found[utils.get_peer_id(new)] = new
+                    pid = utils.get_peer_id(new)
+                    found[pid] = new
+                    ids.append(pid)
                     log.info("Группа «%s» стала супергруппой — беру новую", d.name)
                 except Exception as e:  # noqa: BLE001
                     log.warning("Группа «%s» перенесена, но новая недоступна: %s", d.name, e)
             found[d.id] = ent
+            ids.append(d.id)
+        if mapping is not None:
+            mapping[text] = sorted(set(ids))
     return list(found.values()), missing
 
 
@@ -689,6 +710,7 @@ async def sync_chats(client: TelegramClient, db: DB, cfg: Config, chat_filter: C
                     db.set_monitored(d.id, False)  # чат добавили в исключения
                 continue
             entities[d.id] = d.entity
+            _refresh_chat(db, d.id, d.entity, d.name)  # название в базе — всегда актуальное
             known = db.chat_row(d.id)
             if known is not None and not known["monitored"]:
                 db.set_monitored(d.id, True)  # чат убрали из исключений
@@ -699,9 +721,11 @@ async def sync_chats(client: TelegramClient, db: DB, cfg: Config, chat_filter: C
                 targets[d.id] = d.entity
     else:
         await client.get_dialogs()  # прогреваем кеш, чтобы находить чаты по id
-        resolved, missing = await resolve_chats(client, cfg.chats) if cfg.chats else ([], [])
+        mapping: dict[str, list[int]] = {}
+        resolved, missing = await resolve_chats(client, cfg.chats, mapping) if cfg.chats else ([], [])
         for m in missing:
             log.warning("Чат «%s» из telegram.chats не найден", m)
+        db.set_kv("listed_resolved_ids", json.dumps(mapping, ensure_ascii=False))
         for ent in resolved:
             if not is_forbidden(ent) and chat_filter.allows(ent, explicit=True):
                 cid = utils.get_peer_id(ent)
@@ -749,7 +773,7 @@ async def sync_chats(client: TelegramClient, db: DB, cfg: Config, chat_filter: C
         recent = db.chats_with_recent_rows(to_db(window_start)) & db.monitored_chat_ids() & set(entities)
         for chat_id in sorted(recent - failed):
             row = db.chat_row(chat_id)
-            if chat_id in busy or (row is not None and row["backfill_before"]):
+            if chat_id in busy or (row is not None and row["last_sync"] is None):
                 continue  # первая выгрузка не завершена — сначала докачаем историю
             try:
                 _, deleted = await reconcile_recent(client, db, entities[chat_id], cfg.reconcile_days)
@@ -762,6 +786,22 @@ async def sync_chats(client: TelegramClient, db: DB, cfg: Config, chat_filter: C
 
 
 # ---------------------------------------------------------------------- живое прослушивание
+async def _is_excluded_migration(client: TelegramClient, db: DB, chat_filter: ChatFilter, entity) -> bool:
+    """Новая супергруппа может быть продолжением исключённой группы — проверяем (запрос только на чтение)."""
+    if not isinstance(entity, Channel) or not entity.megagroup:
+        return False
+    try:
+        full = await client(functions.channels.GetFullChannelRequest(entity))
+    except Exception:  # noqa: BLE001
+        return False
+    src = getattr(full.full_chat, "migrated_from_chat_id", None)
+    if not src:
+        return False
+    src_peer = -int(src)
+    row = db.chat_row(src_peer)
+    return chat_filter.note_migration_ids(src_peer, utils.get_peer_id(entity), row["title"] if row else None)
+
+
 def attach_live_listener(client: TelegramClient, db: DB, cfg: Config, chat_filter: ChatFilter,
                          busy: set[int] | None = None, online_state: dict | None = None) -> None:
     """Сохраняет новые/изменённые сообщения в реальном времени, отмечает удалённые.
@@ -802,6 +842,8 @@ def attach_live_listener(client: TelegramClient, db: DB, cfg: Config, chat_filte
             except Exception:  # noqa: BLE001
                 return
             if entity is None or not chat_filter.allows(entity):
+                return
+            if await _is_excluded_migration(client, db, chat_filter, entity):
                 return
             downloading.add(chat_id)
             asyncio.create_task(_download_new_chat(chat_id, entity))

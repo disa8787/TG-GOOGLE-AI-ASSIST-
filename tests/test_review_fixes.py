@@ -68,6 +68,11 @@ class FakeTG:
         self.entities: dict[int, object] = {}
         self.history: dict[int, list] = {}
         self.handlers = []
+        self.migrated_from: dict[int, int] = {}  # id супергруппы → id обычной группы, из которой она получилась
+
+    async def __call__(self, request):  # только channels.GetFullChannelRequest
+        return SimpleNamespace(full_chat=SimpleNamespace(
+            migrated_from_chat_id=self.migrated_from.get(request.channel.id)))
 
     def add(self, entity, messages):
         self.entities[peer(entity.id)] = entity
@@ -543,7 +548,9 @@ class ThirdRoundTests(Base):
     def test_renamed_excluded_chat_stays_excluded(self):
         self.db.upsert_chat(peer(41), "Семья", None, "группа")
         self.cfg.exclude_chats = ["Семья"]
-        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        f = ChatFilter(self.cfg, self.db)
+        self.assertFalse(f.allows(group(41, "Семья")), "живое название из Telegram — связь запоминается")
+        f.apply_to_db(self.db)
         self.db.upsert_chat(peer(41), "Семья 🏠", None, "группа")  # переименовали в Telegram
         ChatFilter(self.cfg, self.db).apply_to_db(self.db)
         self.assertNotIn(peer(41), self.db.monitored_chat_ids())
@@ -654,6 +661,80 @@ class ThirdRoundTests(Base):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "config.yaml").write_bytes("telegram:\n  exclude_chats: Семья\n".encode("cp1251"))
             self.assertEqual(load_config(Path(d)).exclude_chats, ["Семья"])
+
+
+class FinalRoundTests(Base):
+    def test_stale_db_title_does_not_bind_exclusion_forever(self):
+        self.db.upsert_chat(1001, "Лена", None, "личный")  # контакт давно переименовали, в базе старое название
+        self.cfg.exclude_chats = ["Лена"]  # владелец имеет в виду другого человека
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        self.db.upsert_chat(1001, "Лена Иванова", None, "личный")  # синхронизация обновила название
+        f = ChatFilter(self.cfg, self.db)
+        self.assertTrue(f.allows(types.User(id=1001, first_name="Лена Иванова")))
+        f.apply_to_db(self.db)
+        self.assertIn(1001, self.db.monitored_chat_ids())
+
+    def test_list_mode_keeps_migrated_supergroup(self):
+        self.cfg.all_chats = False
+        self.cfg.chats = [-555]
+        old = types.Chat(id=555, title="Семья", photo=types.ChatPhotoEmpty(), participants_count=3, date=NOW,
+                         version=1, migrated_to=types.InputChannel(channel_id=999, access_hash=0))
+        sg = group(999, "Семья 🏠")
+        tg = FakeTG()
+        tg.add(sg, [tl_msg(999, 1, "дом")])
+        tg.entities[-555] = old
+        tg.history[-555] = []
+
+        async def get_entity(x):
+            return sg if getattr(x, "channel_id", None) == 999 else tg.entities[x]
+        tg.get_entity = get_entity
+        asyncio.run(sync_chats(tg, self.db, self.cfg, ChatFilter(self.cfg, self.db)))
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)  # как ночью / при следующем запуске
+        self.assertIn(peer(999), self.db.monitored_chat_ids())
+
+    def test_live_migration_of_excluded_group_is_ignored(self):
+        self.cfg.exclude_chats = [-555]
+        sg = group(998, "Семья (новая)")
+        tg = FakeTG()
+        tg.add(sg, [tl_msg(998, 1, "очень личное")])
+        tg.migrated_from[998] = 555
+        attach_live_listener(tg, self.db, self.cfg, ChatFilter(self.cfg, self.db), set())
+
+        async def go():
+            async def get_chat():
+                return sg
+            await tg.handler("NewMessage")(SimpleNamespace(chat_id=peer(998), message=tg.history[peer(998)][0],
+                                                           get_chat=get_chat))
+            await asyncio.sleep(0.05)
+        asyncio.run(go())
+        self.assertEqual(self.db.chats(), [], "продолжение исключённой группы не скачивается")
+        self.assertFalse(ChatFilter(self.cfg, self.db).allows(sg), "и запомнено")
+
+    def test_quiet_reenabled_chat_is_still_reconciled(self):
+        g = group(49)
+        tg = FakeTG()
+        tg.add(g, [tl_msg(49, 1, "a", minutes_ago=100), tl_msg(49, 2, "b", minutes_ago=90)])
+        asyncio.run(download_chat(tg, self.db, g, progress=lambda s: None))
+        self.cfg.exclude_chats = ["Группа"]
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        self.cfg.exclude_chats = []
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        tg.history[peer(49)] = tg.history[peer(49)][:1]  # «b» удалили, новых сообщений нет
+        asyncio.run(sync_chats(tg, self.db, self.cfg, ChatFilter(self.cfg, self.db)))
+        deleted = [r["msg_id"] for r in self.db.read_messages([peer(49)]) if r["deleted_at"]]
+        self.assertEqual(deleted, [2])
+
+    def test_old_list_explicit_flags_are_migrated(self):
+        self.db.upsert_chat(-60, "Работа", None, "группа")
+        self.db.upsert_chat(-61, "Семья", None, "группа")
+        for cid in (-60, -61):
+            self.db.set_explicit(cid, True)  # так их помечали прошлые версии в режиме списка
+        self.cfg.all_chats = False
+        self.cfg.chats = ["Работа", "Семья"]
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        self.cfg.chats = ["Работа"]
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        self.assertEqual(self.db.monitored_chat_ids(), {-60})
 
 
 class MigrationTests(unittest.TestCase):

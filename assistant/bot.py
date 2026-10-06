@@ -214,13 +214,26 @@ async def run_app(cfg: Config) -> None:
         register_bot_handlers(bot, user, asst, sched, owner_id, chat_filter, busy, sync)
 
     async def initial_sync() -> None:
-        try:
-            new = await sync()
+        """Докачка пропущенного при запуске. Не получилось (нет сети и т.п.) — повторяем с паузами."""
+        attempt, told = 0, False
+        while True:
+            try:
+                new = await sync()
+            except Exception:  # noqa: BLE001
+                log.exception("Ошибка синхронизации чатов — повторю")
+                if not told:
+                    told = True
+                    try:
+                        await notify("⚠️ Не получилось докачать пропущенное (нет связи?). Повторю автоматически.")
+                    except Exception:  # noqa: BLE001
+                        pass
+                attempt += 1
+                await asyncio.sleep(min(300, 30 * 2 ** min(attempt, 4)))
+                continue
             log.info("Синхронизация завершена: новых сообщений %s", new)
             if new:
                 await notify(f"🔄 Докачал пропущенное: {new} новых сообщений.")
-        except Exception:  # noqa: BLE001
-            log.exception("Ошибка синхронизации чатов (повторить: /sync)")
+            return
 
     tasks += sched.tasks() + [asyncio.create_task(initial_sync(), name="initial-sync")]
 
