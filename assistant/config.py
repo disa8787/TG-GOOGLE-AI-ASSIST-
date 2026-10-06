@@ -218,8 +218,11 @@ def load_config(root: Path = ROOT) -> Config:
     user_cfg: dict = {}
     if cfg_path.exists():
         try:
-            with open(cfg_path, encoding="utf-8-sig") as f:
-                user_cfg = yaml.safe_load(f) or {}
+            try:
+                text = cfg_path.read_text(encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                text = cfg_path.read_text(encoding="cp1251")  # старый Блокнот сохраняет в кодировке Windows
+            user_cfg = yaml.safe_load(text) or {}
         except yaml.YAMLError as e:
             mark = getattr(e, "problem_mark", None)
             where = f" (строка {mark.line + 1})" if mark is not None else ""

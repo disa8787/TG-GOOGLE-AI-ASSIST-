@@ -42,7 +42,6 @@ class Scheduler:
             asyncio.create_task(self.report_loop(), name="report"),
             asyncio.create_task(self.watch_loop(), name="watch"),
             asyncio.create_task(self.nightly_loop(), name="nightly-learn"),
-            asyncio.create_task(self.heartbeat_loop(), name="heartbeat"),
         ]
 
     # ------------------------------------------------------------------ напоминания
@@ -189,7 +188,8 @@ class Scheduler:
     # ------------------------------------------------------------------ «программа в сети»
     async def heartbeat_loop(self) -> None:
         """Раз в минуту отмечает, что программа работает. При следующем запуске по этой отметке
-        видно, с какого момента компьютер был выключен — пришедшее после неё считается новым."""
+        видно, с какого момента компьютер был выключен — пришедшее после неё считается новым.
+        Запускается только после успешной стартовой докачки, иначе отметка ушла бы вперёд раньше времени."""
         while True:
             try:
                 self.db.set_kv("last_online", to_db(utcnow()))

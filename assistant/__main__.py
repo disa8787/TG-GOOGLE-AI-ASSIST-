@@ -147,7 +147,6 @@ async def cmd_download(cfg, args) -> None:
             else:
                 kept.append(e)
         entities = kept
-        explicit_ids = {utils.get_peer_id(e) for e in entities}
 
     media = args.media or cfg.download_media
     media_dir = cfg.data_dir / "media" if media else None

@@ -92,7 +92,7 @@ async def read_attachments(bot: TelegramClient, msg) -> tuple[list[dict], list[s
 
 
 def register_bot_handlers(bot: TelegramClient, user: TelegramClient, asst: Assistant, sched: Scheduler,
-                          owner_id: int, chat_filter: ChatFilter, busy: set[int]) -> None:
+                          owner_id: int, chat_filter: ChatFilter, busy: set[int], sync) -> None:
     cfg = asst.cfg
 
     async def run_with_typing(chat_id, coro):
@@ -138,7 +138,7 @@ def register_bot_handlers(bot: TelegramClient, user: TelegramClient, asst: Assis
                 asst.reset_dialog()
                 await send(bot, chat_id, "Ок, начинаем с чистого листа. Память и архив на месте.")
             elif cmd == "/sync":
-                n = await run_with_typing(chat_id, sync_chats(user, asst.db, cfg, chat_filter, busy))
+                n = await run_with_typing(chat_id, sync())
                 await send(bot, chat_id, f"Готово, новых сообщений: {n}")
             elif cmd == "/status":
                 await send(bot, chat_id, asst.status_text())
@@ -192,22 +192,37 @@ async def run_app(cfg: Config) -> None:
         print("\n" + text + "\n", flush=True)
         _append_notification(cfg, text)
 
+    # пока не докачано пропущенное, новые чаты тоже считают «новым» всё, что пришло после выключения
+    online_state = {"since": online_since}
+    tasks: list[asyncio.Task] = []
+    heartbeat_started = False
+
+    async def sync() -> int:
+        """Докачка пропущенного. После первой успешной — запускаем отметку «в сети»."""
+        nonlocal heartbeat_started
+        n = await sync_chats(user, asst.db, cfg, chat_filter, busy, online_since=online_state["since"])
+        online_state["since"] = None
+        if not heartbeat_started:
+            heartbeat_started = True
+            tasks.append(asyncio.create_task(sched.heartbeat_loop(), name="heartbeat"))
+        return n
+
     # слушаем сразу, чтобы не пропустить сообщения, пока докачивается история
-    attach_live_listener(user, asst.db, cfg, chat_filter, busy)
+    attach_live_listener(user, asst.db, cfg, chat_filter, busy, online_state)
     sched = Scheduler(asst, notify, set())
     if bot is not None:
-        register_bot_handlers(bot, user, asst, sched, owner_id, chat_filter, busy)
+        register_bot_handlers(bot, user, asst, sched, owner_id, chat_filter, busy, sync)
 
     async def initial_sync() -> None:
         try:
-            new = await sync_chats(user, asst.db, cfg, chat_filter, busy, online_since=online_since)
+            new = await sync()
             log.info("Синхронизация завершена: новых сообщений %s", new)
             if new:
                 await notify(f"🔄 Докачал пропущенное: {new} новых сообщений.")
         except Exception:  # noqa: BLE001
-            log.exception("Ошибка синхронизации чатов")
+            log.exception("Ошибка синхронизации чатов (повторить: /sync)")
 
-    tasks = sched.tasks() + [asyncio.create_task(initial_sync(), name="initial-sync")]
+    tasks += sched.tasks() + [asyncio.create_task(initial_sync(), name="initial-sync")]
 
     mode = "все чаты" if cfg.all_chats else f"{len(cfg.chats)} выбранных чатов"
     print(f"✅ Ассистент запущен ({mode}, Telegram — только чтение). Докачиваю пропущенное в фоне…")

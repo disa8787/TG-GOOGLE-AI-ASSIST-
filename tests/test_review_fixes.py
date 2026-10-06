@@ -522,6 +522,140 @@ class ConfigEdgeTests(unittest.TestCase):
         _assert_read_only(functions.contacts.ResolveUsernameRequest(username="x"))
 
 
+class ThirdRoundTests(Base):
+    def test_chat_back_from_exclusion_does_not_flood_watch(self):
+        g = group(40, "Болтовня")
+        tg = FakeTG()
+        tg.add(g, [tl_msg(40, 1, "давно", minutes_ago=60 * 24 * 40)])
+        asyncio.run(download_chat(tg, self.db, g, progress=lambda s: None))
+        self.cfg.exclude_chats = ["Болтовня"]
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        # пока чат исключён, в нём месяц шла переписка
+        tg.history[peer(40)] += [tl_msg(40, i, f"пока исключён {i}", minutes_ago=60 * 24 * 30 - i)
+                                 for i in range(2, 300)]
+        self.cfg.exclude_chats = []
+        Assistant(self.cfg).db.conn.close()  # как при запуске любой команды — исключение снимается
+        asyncio.run(sync_chats(tg, self.db, self.cfg, ChatFilter(self.cfg, self.db)))
+        new_rows = self.db.messages_after_rowid(0, {peer(40)}, exclude_backfill=True)
+        self.assertEqual([r["msg_id"] for r in new_rows], [], "пропущенное за время исключения — не «новое»")
+        self.assertEqual(len(self.db.read_messages([peer(40)], limit=1000)), 299)
+
+    def test_renamed_excluded_chat_stays_excluded(self):
+        self.db.upsert_chat(peer(41), "Семья", None, "группа")
+        self.cfg.exclude_chats = ["Семья"]
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        self.db.upsert_chat(peer(41), "Семья 🏠", None, "группа")  # переименовали в Telegram
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        self.assertNotIn(peer(41), self.db.monitored_chat_ids())
+        self.assertFalse(ChatFilter(self.cfg, self.db).allows(group(41, "Семья 🏠")))
+
+    def test_basic_group_exclusion_follows_migration(self):
+        old = types.Chat(id=4242, title="Семья", photo=types.ChatPhotoEmpty(), participants_count=3, date=NOW,
+                         version=1, migrated_to=types.InputChannel(channel_id=77, access_hash=0))
+        self.cfg.exclude_chats = [-4242]
+        f = ChatFilter(self.cfg, self.db)
+        f.note_migration(old)
+        self.assertFalse(f.allows(group(77, "Семья (супергруппа)")))
+        self.assertFalse(ChatFilter(self.cfg, self.db).allows(group(77, "Семья (супергруппа)")), "запомнено")
+
+    def test_list_mode_removed_chat_is_hidden_and_exact_names(self):
+        self.cfg.all_chats = False
+        self.cfg.chats = ["Работа", "Семья"]
+        tg = FakeTG()
+        tg.add(group(42, "Работа"), [tl_msg(42, 1, "груз")])
+        tg.add(group(43, "Семья"), [tl_msg(43, 1, "дом")])
+        asyncio.run(sync_chats(tg, self.db, self.cfg, ChatFilter(self.cfg, self.db)))
+        self.assertEqual(self.db.monitored_chat_ids(), {peer(42), peer(43)})
+        self.cfg.chats = ["Работа"]
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        self.assertEqual(self.db.monitored_chat_ids(), {peer(42)}, "убрали из списка — больше не видно")
+        # точное совпадение названия важнее подстроки
+        for cid, title in ((44, "Аня"), (45, "Таня"), (46, "Ваня (врач)")):
+            self.db.upsert_chat(peer(cid), title, None, "личный")
+        self.cfg.chats = ["Аня"]
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        self.assertEqual(self.db.monitored_chat_ids(), {peer(44)})
+
+    def test_new_chat_found_during_startup_sync_keeps_offline_messages_new(self):
+        g = group(47, "Новый контакт")
+        tg = FakeTG()
+        tg.add(g, [tl_msg(47, 1, "старое", minutes_ago=60 * 24 * 30), tl_msg(47, 2, "написал ночью", minutes_ago=300),
+                   tl_msg(47, 3, "ты тут?")])
+        state = {"since": NOW - timedelta(hours=10)}
+        attach_live_listener(tg, self.db, self.cfg, ChatFilter(self.cfg, self.db), set(), state)
+
+        async def go():
+            async def get_chat():
+                return g
+            await tg.handler("NewMessage")(SimpleNamespace(chat_id=peer(47), message=tg.history[peer(47)][-1],
+                                                           get_chat=get_chat))
+            await asyncio.sleep(0.05)
+        asyncio.run(go())
+        flags = {r["msg_id"]: r["backfill"] for r in self.db.read_messages([peer(47)])}
+        self.assertEqual(flags, {1: 1, 2: 0, 3: 0})
+
+    def test_failed_first_download_is_not_filled_by_reconcile(self):
+        g = group(48)
+        tg = FakeTG()
+        tg.add(g, [tl_msg(48, i, f"m{i}", minutes_ago=2000 - i) for i in range(1, 1201)])
+
+        async def broken(entity, **kw):
+            async for m in FakeTG.iter_messages(tg, entity, **kw):
+                if m.id == 700 and kw.get("offset_date") is None:
+                    raise RuntimeError("сеть пропала")
+                yield m
+        tg.iter_messages = broken
+        asyncio.run(sync_chats(tg, self.db, self.cfg, ChatFilter(self.cfg, self.db)))
+        rows = self.db.read_messages([peer(48)], limit=5000)
+        self.assertEqual(len(rows), 500, "сверка не дописывает историю недокачанного чата")
+        self.assertEqual({r["backfill"] for r in rows}, {1})
+
+    def test_nightly_newness_is_by_first_message_not_download_time(self):
+        self.db.set_kv("learn_cursor:-1", "1")
+        self.db.set_kv("learn_started_at", to_db(utcnow() - timedelta(days=1)))
+        self.db.upsert_chat(-50, "Психотерапевт", None, "личный")  # скачан после learn, но переписка давняя
+        self.db.upsert_messages([row(-50, 1, "личное", minutes_ago=60 * 24 * 100)])
+        self.db.mark_synced(-50)
+        from assistant.learn import nightly_scope
+        eligible, deferred = nightly_scope(self.asst)
+        self.assertNotIn(-50, eligible)
+        self.assertIn("Психотерапевт", [t for t, _, _ in deferred])
+
+    def test_legacy_mixed_notes_hidden_when_something_is_excluded(self):
+        self.db.upsert_chat(-51, "Семья", None, "группа")
+        self.db.add_learn_note(None, "2026-10-01 — 2026-10-02", "старое смешанное изложение")
+        self.db.add_learn_note(-52, "2026-10-01 — 2026-10-02", "рабочее")
+        self.db.upsert_chat(-52, "Работа", None, "группа")
+        self.cfg.exclude_chats = ["Семья"]
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        client, fake = fake_client([text_resp("профиль")])
+        self.asst.llm.client = client
+        asyncio.run(build_profile(self.asst, "claude-opus-5-5", say=lambda s: None))
+        self.assertNotIn("смешанное", fake.calls[0]["messages"][0]["content"])
+
+    def test_ungrouped_long_numbers_not_masked_by_prefix(self):
+        from assistant.util import _luhn_ok
+        d = next(f"4111111111111111{t}" for t in range(10) if not _luhn_ok(f"4111111111111111{t}"))
+        self.assertEqual(mask_cards(f"BOL {d}"), f"BOL {d}")
+
+    def test_heartbeat_not_started_by_scheduler(self):
+        async def go():
+            async def notify(_):
+                pass
+            sched = Scheduler(self.asst, notify, set())
+            tasks = sched.tasks()
+            names = {t.get_name() for t in tasks}
+            for t in tasks:
+                t.cancel()
+            return names
+        self.assertNotIn("heartbeat", asyncio.run(go()))
+
+    def test_cp1251_config(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "config.yaml").write_bytes("telegram:\n  exclude_chats: Семья\n".encode("cp1251"))
+            self.assertEqual(load_config(Path(d)).exclude_chats, ["Семья"])
+
+
 class MigrationTests(unittest.TestCase):
     def test_database_from_first_version_is_upgraded(self):
         with tempfile.TemporaryDirectory() as d:

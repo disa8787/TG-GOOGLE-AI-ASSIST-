@@ -128,7 +128,8 @@ def nightly_scope(asst: Assistant) -> tuple[set[int], list[tuple[str, int, int]]
         if not rows:
             continue
         chars = sum(len(_line(r, cfg.tz, False)) + 1 for r in rows)
-        new_since_consent = bool(consent_at and chat["added_at"] and chat["added_at"] > consent_at)
+        # «новый» — переписка началась после согласия (а не просто попала в архив позже)
+        new_since_consent = bool(consent_at and chat["first_date"] and chat["first_date"] > consent_at)
         downloaded = chat["last_sync"] is not None
         if new_since_consent and downloaded and chars <= budget:
             eligible.add(chat["chat_id"])
@@ -248,12 +249,15 @@ async def build_profile(asst: Assistant, model: str, say: Say = print) -> bool:
     cfg, db = asst.cfg, asst.db
     titles = db.chat_titles()
     monitored = db.monitored_chat_ids()
+    any_hidden = any(not c["monitored"] for c in db.chats())
 
     def visible(n) -> bool:
         # изложения исключённых чатов в профиль не попадают
         if n["chat_id"] is not None:
             return n["chat_id"] in monitored
-        ids = [int(x) for x in (n["chat_ids"] or "").split(",") if x.strip().lstrip("-").isdigit()]
+        if not n["chat_ids"]:
+            return not any_hidden  # старое изложение нескольких чатов без списка — если есть исключения, пропускаем
+        ids = [int(x) for x in n["chat_ids"].split(",") if x.strip().lstrip("-").isdigit()]
         return all(i in monitored for i in ids)
 
     notes = [n for n in db.learn_notes() if visible(n)]

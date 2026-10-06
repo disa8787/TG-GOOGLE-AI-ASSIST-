@@ -384,6 +384,24 @@ class DB:
         ]
         return ids
 
+    def match_chat_ids(self, spec: str | int) -> list[int]:
+        """Чаты архива под запись из telegram.chats — по тем же правилам, что и при выборе в Telegram:
+        числовой id; @username — точно; название — сначала точное совпадение, иначе по части."""
+        text = str(spec).strip()
+        if not text:
+            return []
+        rows = self.conn.execute("SELECT chat_id, title, username FROM chats").fetchall()
+        if text.lstrip("-").isdigit():
+            num = int(text)
+            forms = {num, -num, int(f"-100{abs(num)}")}
+            return [r["chat_id"] for r in rows if r["chat_id"] in forms]
+        if text.startswith("@"):
+            name = text[1:].lower()
+            return [r["chat_id"] for r in rows if (r["username"] or "").lower() == name]
+        needle = text.lower()
+        exact = [r["chat_id"] for r in rows if (r["title"] or "").lower() == needle]
+        return exact or [r["chat_id"] for r in rows if needle in (r["title"] or "").lower()]
+
     # ------------------------------------------------------------------ сообщения
     def last_msg_id(self, chat_id: int) -> int:
         row = self.conn.execute("SELECT max(msg_id) AS m FROM messages WHERE chat_id=?", (chat_id,)).fetchone()

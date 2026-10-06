@@ -102,7 +102,10 @@ def mask_cards(text: str) -> str:
 
     def repl(m: re.Match) -> str:
         digits = re.sub(r"\D", "", m.group(0))
-        if 13 <= len(digits) <= 19 and (_luhn_ok(digits) or (len(digits) > 16 and _luhn_ok(digits[:16]))):
+        grouped_4444 = m.group(1) is not None  # только для записи группами 4-4-4-4-хвост
+        if 13 <= len(digits) <= 19 and (
+            _luhn_ok(digits) or (grouped_4444 and len(digits) > 16 and _luhn_ok(digits[:16]))
+        ):
             return f"[карта ****{digits[-4:]}]"
         return m.group(0)
 
