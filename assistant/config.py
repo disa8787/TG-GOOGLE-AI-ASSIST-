@@ -106,6 +106,8 @@ def _hm(value, default: str) -> str:
 
 
 ALL_WORDS = {"all", "все", "всё", "*"}
+# заглушка из первой версии config.example.yaml — если её не заменили, значит берём все чаты
+PLACEHOLDER_CHATS = {"название рабочего чата"}
 
 
 def _as_list(value) -> list:
@@ -123,7 +125,8 @@ def _chat_selection(value) -> tuple[bool, list]:
         return True, []
     if isinstance(value, str):
         return (True, []) if value.strip().lower() in ALL_WORDS else (False, [value])
-    items = [v for v in _as_list(value) if v is not None and str(v).strip()]
+    items = [v for v in _as_list(value)
+             if v is not None and str(v).strip() and str(v).strip().lower() not in PLACEHOLDER_CHATS]
     if not items or any(str(v).strip().lower() in ALL_WORDS for v in items):
         return True, []
     return False, items

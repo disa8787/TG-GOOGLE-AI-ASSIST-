@@ -688,7 +688,8 @@ def _media_args(cfg: Config) -> dict:
 
 async def sync_chats(client: TelegramClient, db: DB, cfg: Config, chat_filter: ChatFilter,
                      busy: set[int] | None = None, reconcile: bool = True,
-                     online_since: datetime | None = None) -> int:
+                     online_since: datetime | None = None,
+                     on_chat: Callable[[int, int, str, int], None] | None = None) -> int:
     """Докачивает всё новое (например, после выключения компьютера) и подтягивает правки/удаления
     за последние дни. В режиме «все чаты» заодно находит новые чаты и скачивает их историю целиком."""
     total = 0
@@ -725,6 +726,9 @@ async def sync_chats(client: TelegramClient, db: DB, cfg: Config, chat_filter: C
         resolved, missing = await resolve_chats(client, cfg.chats, mapping) if cfg.chats else ([], [])
         for m in missing:
             log.warning("Чат «%s» из telegram.chats не найден", m)
+        if cfg.chats and not resolved:
+            log.warning("Ни один чат из telegram.chats не найден — проверь названия (assistant chats) "
+                        "или поставь chats: all в config.yaml")
         db.set_kv("listed_resolved_ids", json.dumps(mapping, ensure_ascii=False))
         for ent in resolved:
             if not is_forbidden(ent) and chat_filter.allows(ent, explicit=True):
@@ -750,7 +754,7 @@ async def sync_chats(client: TelegramClient, db: DB, cfg: Config, chat_filter: C
 
     busy = busy if busy is not None else set()
     failed: set[int] = set()
-    for chat_id, entity in targets.items():
+    for index, (chat_id, entity) in enumerate(targets.items(), 1):
         if chat_id in busy:
             continue  # этот чат уже скачивается
         is_new = db.synced_msg_id(chat_id) == 0
@@ -767,6 +771,8 @@ async def sync_chats(client: TelegramClient, db: DB, cfg: Config, chat_filter: C
         if n:
             log.info("%s «%s»: +%s сообщений", "Новый чат" if is_new else "Докачано", display_name(entity), n)
         total += n
+        if on_chat is not None:
+            on_chat(index, len(targets), display_name(entity) or str(chat_id), n)
 
     if reconcile and cfg.reconcile_days > 0:
         # сверяем чаты, где в архиве есть сообщения за последние дни (в т.ч. если новых с тех пор не было)

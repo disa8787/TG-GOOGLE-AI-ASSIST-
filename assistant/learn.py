@@ -303,6 +303,34 @@ async def build_profile(asst: Assistant, model: str, say: Say = print) -> bool:
     return True
 
 
+def learn_estimate(asst: Assistant, model: str | None = None) -> dict:
+    """Сколько предстоит изучить и сколько это примерно стоит (без запросов к Claude)."""
+    model = model or asst.cfg.model
+    ChatFilter(asst.cfg, asst.db).apply_to_db(asst.db)
+    plan = build_plan(asst, None)
+    chars = sum(c.size for c in plan)
+    cost = estimate_cost(model, int(chars / 2.5 + len(plan) * 12000), len(plan) * 5000)
+    return {
+        "parts": len(plan),
+        "messages": sum(c.count for c in plan),
+        "chats": len({cid for c in plan for cid in c.rows}),
+        "cost": cost,
+        "model": model,
+    }
+
+
+async def learn_everything(asst: Assistant, say: Say, model: str | None = None) -> bool:
+    """Изучить всю неизученную историю, таблицы и составить профиль — владелец уже подтвердил стоимость."""
+    model = model or asst.cfg.model
+    ChatFilter(asst.cfg, asst.db).apply_to_db(asst.db)
+    ok = await learn_history(asst, None, model, yes=True, say=say)
+    if not ok:
+        return False
+    await learn_sheets(asst, model, say=say)
+    await build_profile(asst, model, say=say)
+    return True
+
+
 async def run_learn(asst: Assistant, *, chats: list[str] | None, reset: bool, yes: bool,
                     sheets_only: bool, model: str | None) -> None:
     model = model or asst.cfg.model
