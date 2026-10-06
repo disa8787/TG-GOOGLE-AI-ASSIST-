@@ -7,7 +7,10 @@
 from __future__ import annotations
 
 import asyncio
+import getpass
 import logging
+import os
+import sys
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -84,26 +87,50 @@ def remember_owner(db: DB, me) -> None:
     db.set_kv("owner_name", display_name(me) or "")
 
 
-async def connect_user(cfg: Config, db: DB | None = None) -> TelegramClient:
+def login_hint() -> str:
+    if os.name == "nt":
+        return ("Telegram-аккаунт не подключён. Открой папку программы, в адресной строке проводника "
+                "напиши cmd и нажми Enter, затем выполни:\n    assistant.bat login")
+    return "Telegram-аккаунт не подключён. Выполни:  ./assistant.sh login"
+
+
+async def connect_user(cfg: Config, db: DB | None = None, interactive: bool = False) -> TelegramClient:
+    """Подключает аккаунт владельца (только чтение). interactive=True — если не вошли, предложит войти."""
     client = make_user_client(cfg)
     await client.connect()
     if not await client.is_user_authorized():
         await client.disconnect()
-        raise SystemExit("Telegram-аккаунт не подключён. Сначала выполни: assistant login")
+        if not (interactive and sys.stdin is not None and sys.stdin.isatty()):
+            raise SystemExit(login_hint())
+        print("Telegram-аккаунт ещё не подключён — давай войдём (это нужно один раз).\n")
+        await login(cfg, db)
+        client = make_user_client(cfg)
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            raise SystemExit(login_hint())
     if db is not None:
         remember_owner(db, await client.get_me())
     return client
 
 
-async def login(cfg: Config, db: DB) -> None:
+def _ask(prompt: str) -> str:
+    return input(prompt).strip()
+
+
+async def login(cfg: Config, db: DB | None) -> None:
     # Вход — единственный момент, когда нужны «пишущие» запросы (отправка кода подтверждения)
     client = make_user_client(cfg, read_only=False)
-    if cfg.phone:
-        await client.start(phone=cfg.phone)
-    else:
-        await client.start()
+    print("Вход в твой Telegram (один раз). Код подтверждения придёт в приложение Telegram, в чат «Telegram».")
+    await client.start(
+        phone=cfg.phone or (lambda: _ask("Номер телефона в международном формате (например +79991234567): ")),
+        code_callback=lambda: _ask("Код из Telegram: "),
+        password=lambda: getpass.getpass(
+            "Пароль двухэтапной проверки (символы не отображаются при вводе, это нормально): "),
+    )
     me = await client.get_me()
-    remember_owner(db, me)
+    if db is not None:
+        remember_owner(db, me)
     print(f"\n✅ Вход выполнен: {utils.get_display_name(me)} (id {me.id})")
     print("Дальше ассистент работает с аккаунтом только на чтение — ничего не пишет от твоего имени.")
     print("Сессия сохранена в data/user.session — никому не передавай этот файл!")

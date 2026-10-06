@@ -167,7 +167,7 @@ def _append_notification(cfg: Config, text: str) -> None:
 
 async def run_app(cfg: Config) -> None:
     asst = Assistant(cfg)
-    user = await connect_user(cfg, asst.db)  # аккаунт владельца — только чтение
+    user = await connect_user(cfg, asst.db, interactive=True)  # аккаунт владельца — только чтение
     me = await user.get_me()
     owner_id = cfg.owner_id or me.id
     chat_filter = ChatFilter(cfg, asst.db)
