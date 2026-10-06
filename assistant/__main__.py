@@ -51,7 +51,7 @@ async def cmd_login(cfg, _args) -> None:
 
 async def cmd_chats(cfg, args) -> None:
     from .db import DB
-    from .telegram_archive import ChatFilter, chat_kind, connect_user
+    from .telegram_archive import FORBIDDEN_REASON, ChatFilter, chat_kind, connect_user, is_forbidden
 
     db = DB(cfg.data_dir / "assistant.db")
     archived = {r["chat_id"]: r["n"] for r in db.chats()}
@@ -66,7 +66,8 @@ async def cmd_chats(cfg, args) -> None:
         uname = getattr(d.entity, "username", None)
         n = archived.get(d.id)
         if cfg.all_chats:
-            reason = chat_filter.reason_excluded(d.entity, d.name, db.is_explicit(d.id))
+            reason = (FORBIDDEN_REASON if is_forbidden(d.entity)
+                      else chat_filter.reason_excluded(d.entity, d.name, db.is_explicit(d.id)))
             verdict = "✓ берём" if reason is None else f"✗ {reason}"
             taken += reason is None
             skipped += reason is not None
@@ -87,19 +88,27 @@ async def cmd_download(cfg, args) -> None:
 
     from .db import DB
     from .telegram_archive import (
+        FORBIDDEN_REASON,
         ChatFilter,
         all_dialog_entities,
         chat_kind,
         connect_user,
         display_name,
         download_chat,
+        is_forbidden,
         resolve_chats,
     )
-    from .util import parse_local
+    from .util import from_db, parse_local
 
+    try:
+        since = parse_local(args.since, cfg.tz) if args.since else None
+    except ValueError:
+        raise SystemExit(f"Неверная дата --since «{args.since}». Нужно ГГГГ-ММ-ДД, например 2026-09-01") from None
     db = DB(cfg.data_dir / "assistant.db")
     chat_filter = ChatFilter(cfg, db)
     chat_filter.apply_to_db(db)
+    last_online = db.get_kv("last_online")
+    online_since = from_db(last_online) if last_online else None
     client = await connect_user(cfg, db)
     skipped: dict[str, int] = {}
     explicit_ids: set[int] = set()  # выбраны явно — потом не отключаются флагами include_*
@@ -109,7 +118,7 @@ async def cmd_download(cfg, args) -> None:
             print(f"⚠️ Чат «{m}» не найден (посмотри точное название/ID: assistant chats)")
         kept = []
         for e in entities:
-            reason = chat_filter.reason_excluded(e, explicit=True)
+            reason = FORBIDDEN_REASON if is_forbidden(e) else chat_filter.reason_excluded(e, explicit=True)
             if reason:
                 print(f"⚠️ «{display_name(e)}» пропущен: {reason}")
             else:
@@ -132,7 +141,7 @@ async def cmd_download(cfg, args) -> None:
             print(f"⚠️ Чат «{m}» не найден (посмотри точное название/ID: assistant chats)")
         kept = []
         for e in entities:
-            reason = chat_filter.reason_excluded(e, explicit=True)
+            reason = FORBIDDEN_REASON if is_forbidden(e) else chat_filter.reason_excluded(e, explicit=True)
             if reason:
                 print(f"⚠️ «{display_name(e)}» пропущен: {reason}")
             else:
@@ -140,7 +149,6 @@ async def cmd_download(cfg, args) -> None:
         entities = kept
         explicit_ids = {utils.get_peer_id(e) for e in entities}
 
-    since = parse_local(args.since, cfg.tz) if args.since else None
     media = args.media or cfg.download_media
     media_dir = cfg.data_dir / "media" if media else None
     total = 0
@@ -154,7 +162,7 @@ async def cmd_download(cfg, args) -> None:
         print(f"[{i}/{len(entities)}] {name}", flush=True)
         try:
             n = await download_chat(client, db, ent, since=since, media_dir=media_dir,
-                                    explicit=utils.get_peer_id(ent) in explicit_ids,
+                                    explicit=utils.get_peer_id(ent) in explicit_ids, online_since=online_since,
                                     media_max_bytes=cfg.media_max_mb * 1024 * 1024)
         except Exception as e:  # noqa: BLE001
             print(f"  ⚠️ ошибка: {e}")

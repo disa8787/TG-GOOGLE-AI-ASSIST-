@@ -24,7 +24,9 @@ CREATE TABLE IF NOT EXISTS chats(
     last_sync TEXT,
     synced_msg_id INTEGER NOT NULL DEFAULT 0, -- история скачана подряд до этого id (живые сообщения не в счёт)
     since_date    TEXT,                       -- нижняя граница из download --since
-    explicit      INTEGER NOT NULL DEFAULT 0  -- чат выбран явно (--chat / список в конфиге)
+    explicit      INTEGER NOT NULL DEFAULT 0, -- чат выбран явно (--chat / --include-channels)
+    added_at      TEXT,                       -- когда чат появился в архиве
+    backfill_before TEXT                      -- сообщения старше этого момента — старая история
 );
 
 CREATE TABLE IF NOT EXISTS messages(
@@ -121,7 +123,8 @@ CREATE TABLE IF NOT EXISTS learn_notes(
     chat_id    INTEGER,
     period     TEXT,
     summary    TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    chat_ids   TEXT -- для изложения нескольких чатов сразу: их id через запятую
 );
 
 CREATE TABLE IF NOT EXISTS usage(
@@ -242,6 +245,13 @@ class DB:
                 self.conn.execute("ALTER TABLE chats ADD COLUMN since_date TEXT")
             if "explicit" not in chat_cols:
                 self.conn.execute("ALTER TABLE chats ADD COLUMN explicit INTEGER NOT NULL DEFAULT 0")
+            if "added_at" not in chat_cols:
+                self.conn.execute("ALTER TABLE chats ADD COLUMN added_at TEXT")
+            if "backfill_before" not in chat_cols:
+                self.conn.execute("ALTER TABLE chats ADD COLUMN backfill_before TEXT")
+            note_cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(learn_notes)")}
+            if "chat_ids" not in note_cols:
+                self.conn.execute("ALTER TABLE learn_notes ADD COLUMN chat_ids TEXT")
 
     def _init_fts(self) -> None:
         exists = self.conn.execute(
@@ -287,15 +297,27 @@ class DB:
     def upsert_chat(self, chat_id: int, title: str, username: str | None, kind: str) -> None:
         with self.conn:
             self.conn.execute(
-                "INSERT INTO chats(chat_id, title, username, kind) VALUES(?,?,?,?) "
+                "INSERT INTO chats(chat_id, title, username, kind, added_at) VALUES(?,?,?,?,?) "
                 "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, "
                 "username=excluded.username, kind=excluded.kind",
-                (chat_id, title, username, kind),
+                (chat_id, title, username, kind, to_db(utcnow())),
             )
 
     def mark_synced(self, chat_id: int) -> None:
+        """Полная выгрузка чата завершена: дальше всё скачанное — «новое», а не старая история."""
         with self.conn:
-            self.conn.execute("UPDATE chats SET last_sync=? WHERE chat_id=?", (to_db(utcnow()), chat_id))
+            self.conn.execute("UPDATE chats SET last_sync=?, backfill_before=NULL WHERE chat_id=?",
+                              (to_db(utcnow()), chat_id))
+
+    def set_backfill_before(self, chat_id: int, moment: str | None) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE chats SET backfill_before=? WHERE chat_id=?", (moment, chat_id))
+
+    def chats_with_recent_rows(self, since: str) -> set[int]:
+        rows = self.conn.execute(
+            "SELECT DISTINCT chat_id FROM messages WHERE date >= ? AND deleted_at IS NULL", (since,)
+        ).fetchall()
+        return {r["chat_id"] for r in rows}
 
     def set_monitored(self, chat_id: int, monitored: bool) -> None:
         with self.conn:
@@ -382,7 +404,9 @@ class DB:
         )
         sql = (
             f"INSERT INTO messages({cols}) VALUES({marks}) "
-            f"ON CONFLICT(chat_id, msg_id) DO UPDATE SET {updates}"
+            f"ON CONFLICT(chat_id, msg_id) DO UPDATE SET {updates} "
+            # устаревший снимок (например, при сверке) не затирает более свежую правку
+            "WHERE coalesce(excluded.edited_at, '') >= coalesce(messages.edited_at, '')"
         )
         defaults = {"text": "", "outgoing": 0, "backfill": 0}
         values = [
@@ -749,11 +773,13 @@ class DB:
             )
 
     # ------------------------------------------------------------------ обучение
-    def add_learn_note(self, chat_id: int | None, period: str, summary: str) -> None:
+    def add_learn_note(self, chat_id: int | None, period: str, summary: str,
+                       chat_ids: list[int] | None = None) -> None:
         with self.conn:
             self.conn.execute(
-                "INSERT INTO learn_notes(chat_id, period, summary, created_at) VALUES(?,?,?,?)",
-                (chat_id, period, summary, to_db(utcnow())),
+                "INSERT INTO learn_notes(chat_id, period, summary, created_at, chat_ids) VALUES(?,?,?,?,?)",
+                (chat_id, period, summary, to_db(utcnow()),
+                 ",".join(str(c) for c in chat_ids) if chat_ids else None),
             )
 
     def learn_notes(self) -> list[sqlite3.Row]:

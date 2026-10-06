@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from .config import Config
 from .db import DB
-from .llm import LLM
+from .llm import LLM, LLMError
 from .prompts import (
     KNOWLEDGE_TEMPLATE,
     NO_PROFILE,
@@ -41,6 +41,9 @@ class Assistant:
         self.sheets = Sheets(cfg)
         self.llm = LLM(cfg, self.db)
         self.tools = ToolBox(cfg, self.db, self.sheets, source="assistant")
+        # исключения из config.yaml действуют сразу в любой команде (chat, report, learn, run)
+        from .telegram_archive import ChatFilter
+        ChatFilter(cfg, self.db).apply_to_db(self.db)
         # Claude обрабатывает по одной задаче за раз — так проще и дешевле
         self.lock = asyncio.Lock()
 
@@ -197,11 +200,17 @@ class Assistant:
                 parts.append("Изменения в таблицах:\n" + truncate("\n\n".join(changes), 30000))
                 changes = []
             prompt = f"{self.stamp()}\n" + WATCH_REQUEST.format(payload="\n\n".join(parts))
-            async with self.lock:
-                answer = await self.llm.run_agent(
-                    purpose="watch", model=self.cfg.watch_model, system=self.system(),
-                    messages=[{"role": "user", "content": prompt}], toolbox=self.tools, effort=self.cfg.effort_watch,
-                )
+            try:
+                async with self.lock:
+                    answer = await self.llm.run_agent(
+                        purpose="watch", model=self.cfg.watch_model, system=self.system(),
+                        messages=[{"role": "user", "content": prompt}], toolbox=self.tools,
+                        effort=self.cfg.effort_watch,
+                    )
+            except LLMError:
+                if notes:
+                    break  # уже собранное не теряем; остальное — в следующей проверке
+                raise
             if page:
                 cursor_id = page[-1]["id"]
                 self.db.set_kv("watch_last_rowid", str(cursor_id))

@@ -77,7 +77,9 @@ def truncate(text: str, limit: int) -> str:
 # Похожее на номер карты: 13–19 цифр подряд, группы по 4 с одинаковым разделителем (4-4-4-4…) или Amex 4-6-5.
 # Номера грузов, телефоны, индексы через пробел сюда не подходят.
 CARD_RE = re.compile(
-    r"(?<![\d-])(?:\d{13,19}|\d{4}([ -])\d{4}\1\d{4}\1\d{1,7}|\d{4}([ -])\d{6}\2\d{5})(?![\d-])"
+    r"(?<![\d-])(?:\d{13,19}"
+    r"|\d{4}([ -])\d{4}\1\d{4}\1\d{1,4}(?:\1\d{1,3})?"   # 4-4-4-4 (+ хвост 1–3 цифры у 17–19-значных)
+    r"|\d{4}([ -])\d{6}\2\d{5})(?![\d-])"                 # Amex 4-6-5
 )
 
 
@@ -100,7 +102,7 @@ def mask_cards(text: str) -> str:
 
     def repl(m: re.Match) -> str:
         digits = re.sub(r"\D", "", m.group(0))
-        if 13 <= len(digits) <= 19 and _luhn_ok(digits):
+        if 13 <= len(digits) <= 19 and (_luhn_ok(digits) or (len(digits) > 16 and _luhn_ok(digits[:16]))):
             return f"[карта ****{digits[-4:]}]"
         return m.group(0)
 

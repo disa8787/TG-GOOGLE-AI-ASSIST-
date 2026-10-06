@@ -108,13 +108,22 @@ def _hm(value, default: str) -> str:
 ALL_WORDS = {"all", "все", "всё", "*"}
 
 
+def _as_list(value) -> list:
+    """Одиночное значение (строка/число) → список из одного элемента."""
+    if value is None:
+        return []
+    if isinstance(value, (str, int, float)):
+        return [value]
+    return list(value)
+
+
 def _chat_selection(value) -> tuple[bool, list]:
     """chats: all → (True, []); chats: [список] → (False, список). Пустой список тоже значит «все»."""
     if value is None:
         return True, []
     if isinstance(value, str):
         return (True, []) if value.strip().lower() in ALL_WORDS else (False, [value])
-    items = [v for v in value if v is not None and str(v).strip()]
+    items = [v for v in _as_list(value) if v is not None and str(v).strip()]
     if not items or any(str(v).strip().lower() in ALL_WORDS for v in items):
         return True, []
     return False, items
@@ -208,8 +217,18 @@ def load_config(root: Path = ROOT) -> Config:
     cfg_path = root / "config.yaml"
     user_cfg: dict = {}
     if cfg_path.exists():
-        with open(cfg_path, encoding="utf-8-sig") as f:
-            user_cfg = yaml.safe_load(f) or {}
+        try:
+            with open(cfg_path, encoding="utf-8-sig") as f:
+                user_cfg = yaml.safe_load(f) or {}
+        except yaml.YAMLError as e:
+            mark = getattr(e, "problem_mark", None)
+            where = f" (строка {mark.line + 1})" if mark is not None else ""
+            raise SystemExit(
+                f"Ошибка в config.yaml{where}: {getattr(e, 'problem', e)}.\n"
+                "Проверь отступы (пробелы, не табы) и кавычки вокруг текста с двоеточием."
+            ) from e
+        if not isinstance(user_cfg, dict):
+            raise SystemExit("config.yaml должен состоять из настроек вида «ключ: значение».")
     raw = _merge(DEFAULTS, user_cfg)
 
     tz_name = (raw.get("timezone") or "").strip() or _local_tz_name()
@@ -225,7 +244,7 @@ def load_config(root: Path = ROOT) -> Config:
     rep, watch, mem, lrn = raw["report"], raw["watch"], raw["memory"], raw["learn"]
     all_chats, chat_specs = _chat_selection(tg.get("chats"))
     # ignore_chats — старое имя настройки, понимаем и его
-    exclude = list(tg.get("exclude_chats") or []) + list(tg.get("ignore_chats") or [])
+    exclude = _as_list(tg.get("exclude_chats")) + _as_list(tg.get("ignore_chats"))
 
     api_id = os.getenv("TG_API_ID", "").strip()
     owner = os.getenv("OWNER_ID", "").strip()

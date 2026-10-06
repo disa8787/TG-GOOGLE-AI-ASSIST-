@@ -258,10 +258,17 @@ class LearnTests(Base):
         self.db.upsert_chat(-6, "Одобренный", None, "группа")
         self.db.upsert_messages([row(-6, 1, "новое за день")])
         self.db.set_kv("learn_cursor:-6", "1")
+        self.db.upsert_chat(-9, "Старый чат, не выбранный при learn", None, "личный")
+        self.db.upsert_messages([row(-9, 1, "личное старое")])
+        self.db.set_kv("learn_started_at", to_db(utcnow() - timedelta(days=1)))  # ручной learn был вчера
+        self.db.conn.execute("UPDATE chats SET added_at=? WHERE chat_id=-9", (to_db(utcnow() - timedelta(days=5)),))
+        self.db.conn.commit()
         self.db.upsert_chat(-7, "Большая новая группа", None, "группа")
         self.db.upsert_messages([row(-7, i, "история " + "y" * 100, minutes_ago=9000) for i in range(1, 200)])
+        self.db.mark_synced(-7)
         self.db.upsert_chat(-8, "Новый знакомый", None, "личный")
         self.db.upsert_messages([row(-8, 1, "привет, это Олег")])
+        self.db.mark_synced(-8)
         client, fake = fake_client([text_resp(json.dumps({"summary": "s", "facts": []})) for _ in range(10)])
         self.asst.llm.client = client
         sent_notes = []
@@ -274,7 +281,9 @@ class LearnTests(Base):
         self.assertIn("новое за день", prompts)
         self.assertIn("привет, это Олег", prompts, "маленький новый чат изучается сам")
         self.assertNotIn("история yyy", prompts, "большая чужая история — только после ручного learn")
+        self.assertNotIn("личное старое", prompts, "чат, который владелец не выбирал, — не трогаем")
         self.assertTrue(any("Большая новая группа" in n for n in sent_notes))
+        self.assertIsNone(self.db.get_kv("learn_cursor:-8"), "ночью одобрение не выдаётся")
 
     def test_profile_truncation_drops_oldest_not_whole_chats(self):
         import assistant.learn as learn_mod
@@ -380,6 +389,137 @@ class ReadOnlySideEffectTests(unittest.TestCase):
         _assert_read_only(functions.auth.ExportAuthorizationRequest(dc_id=2))
         _assert_read_only(functions.upload.ReuploadCdnFileRequest(file_token=b"", request_token=b""))
         _assert_read_only(functions.help.GetConfigRequest())
+
+
+class SecondRoundTests(Base):
+    def test_resumed_first_download_keeps_backfill_flag(self):
+        g = group(20)
+        tg = FakeTG()
+        tg.add(g, [tl_msg(20, i, f"старое {i}", minutes_ago=90 * 24 * 60) for i in range(1, 1201)])
+
+        async def broken(entity, **kw):
+            async for m in FakeTG.iter_messages(tg, entity, **kw):
+                if m.id == 700:
+                    raise RuntimeError("сеть пропала")
+                yield m
+        tg.iter_messages = broken
+        with self.assertRaises(RuntimeError):
+            asyncio.run(download_chat(tg, self.db, g, progress=lambda s: None))
+        tg.iter_messages = lambda entity, **kw: FakeTG.iter_messages(tg, entity, **kw)
+        asyncio.run(download_chat(tg, self.db, g, progress=lambda s: None))
+        flags = {r["backfill"] for r in self.db.read_messages([peer(20)], limit=5000)}
+        self.assertEqual(flags, {1}, "вся старая история — не «новое», даже после прерывания")
+
+    def test_new_chat_message_received_while_offline_is_new(self):
+        g = group(21, "Новый брокер")
+        tg = FakeTG()
+        tg.add(g, [tl_msg(21, 1, "давняя переписка", minutes_ago=60 * 24 * 30),
+                   tl_msg(21, 2, "груз 222, ответь срочно", minutes_ago=120)])
+        offline_since = NOW - timedelta(hours=10)
+        asyncio.run(sync_chats(tg, self.db, self.cfg, ChatFilter(self.cfg, self.db), online_since=offline_since))
+        flags = {r["msg_id"]: r["backfill"] for r in self.db.read_messages([peer(21)])}
+        self.assertEqual(flags, {1: 1, 2: 0})
+
+    def test_offline_deletion_of_newest_messages_is_marked(self):
+        g = group(22)
+        tg = FakeTG()
+        tg.add(g, [tl_msg(22, i, f"m{i}", minutes_ago=100 - i) for i in range(1, 7)])
+        asyncio.run(download_chat(tg, self.db, g, progress=lambda s: None))
+        tg.history[peer(22)] = tg.history[peer(22)][:4]  # удалили два последних
+        asyncio.run(sync_chats(tg, self.db, self.cfg, ChatFilter(self.cfg, self.db)))
+        deleted = [r["msg_id"] for r in self.db.read_messages([peer(22)]) if r["deleted_at"]]
+        self.assertEqual(deleted, [5, 6])
+
+    def test_reconcile_does_not_overwrite_newer_edit(self):
+        self.db.upsert_chat(-23, "Чат", None, "группа")
+        self.db.upsert_messages([{**row(-23, 1, "версия 2"), "edited_at": "2026-10-06 10:00:00"}])
+        self.db.upsert_messages([{**row(-23, 1, "версия 1"), "edited_at": "2026-10-06 09:00:00"}])
+        self.assertEqual(self.db.read_messages([-23])[0]["text"], "версия 2")
+
+    def test_exclusion_by_raw_id_and_forbidden_chat_kept(self):
+        self.db.upsert_chat(peer(24), "Что-то", None, "группа")
+        self.db.upsert_chat(peer(25), "Группа, откуда удалили", None, "группа")
+        self.cfg.exclude_chats = [24]
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        self.assertNotIn(peer(24), self.db.monitored_chat_ids(), "исключение по «сырому» id")
+        tg = FakeTG()
+        tg.entities[peer(25)] = types.ChannelForbidden(id=25, access_hash=0, title="Группа, откуда удалили")
+        tg.history[peer(25)] = []
+        asyncio.run(sync_chats(tg, self.db, self.cfg, ChatFilter(self.cfg, self.db)))
+        self.assertIn(peer(25), self.db.monitored_chat_ids(), "архив чата, откуда удалили, остаётся виден")
+
+    def test_profile_skips_excluded_chat_summaries(self):
+        self.db.upsert_chat(-26, "Семья", None, "группа")
+        self.db.upsert_chat(-27, "Работа", None, "группа")
+        self.db.add_learn_note(-26, "2026-10-01 — 2026-10-02", "семейные дела")
+        self.db.add_learn_note(None, "2026-10-01 — 2026-10-02", "смешанное с семьёй", chat_ids=[-26, -27])
+        self.db.add_learn_note(-27, "2026-10-01 — 2026-10-02", "рабочие дела")
+        self.cfg.exclude_chats = ["Семья"]
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        client, fake = fake_client([text_resp("профиль")])
+        self.asst.llm.client = client
+        asyncio.run(build_profile(self.asst, "claude-opus-5-5", say=lambda s: None))
+        prompt = fake.calls[0]["messages"][0]["content"]
+        self.assertIn("рабочие дела", prompt)
+        self.assertNotIn("семейные", prompt)
+        self.assertNotIn("смешанное", prompt)
+
+    def test_any_command_applies_exclusions(self):
+        self.db.upsert_chat(-28, "Семья", None, "группа")
+        self.db.upsert_messages([row(-28, 1, "диагноз")])
+        self.cfg.exclude_chats = ["Семья"]
+        fresh = Assistant(self.cfg)  # как при запуске assistant chat / report
+        self.assertNotIn(-28, fresh.db.monitored_chat_ids())
+        fresh.db.conn.close()
+
+    def test_watch_keeps_notes_when_later_pass_fails(self):
+        import assistant.brain as brain_mod
+        from assistant.llm import LLMError
+
+        class Flaky:
+            calls = 0
+
+            async def create(self, **kw):
+                Flaky.calls += 1
+                if Flaky.calls == 2:
+                    raise LLMError("сбой")
+                return text_resp("Иван сломался")
+        self.asst.llm.client = SimpleNamespace(beta=SimpleNamespace(messages=Flaky()))
+        self.db.upsert_chat(-29, "Чат", None, "группа")
+        asyncio.run(self.asst.watch_check())
+        self.db.upsert_messages([row(-29, i, "z" * 400) for i in range(1, 40)])
+        old = brain_mod.WATCH_PAYLOAD_CHARS
+        brain_mod.WATCH_PAYLOAD_CHARS = 3000
+        try:
+            note = asyncio.run(self.asst.watch_check())
+        finally:
+            brain_mod.WATCH_PAYLOAD_CHARS = old
+        self.assertEqual(note, "Иван сломался", "заметка первого захода не потерялась")
+
+    def test_list_mode_narrows_to_listed_chats(self):
+        self.cfg.all_chats = False
+        self.cfg.chats = ["Работа"]
+        self.db.upsert_chat(-30, "Работа", None, "группа")
+        self.db.upsert_chat(-31, "Скачано раньше", None, "группа")
+        self.db.upsert_chat(-32, "Скачано через --chat", None, "группа")
+        self.db.set_explicit(-32, True)
+        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+        self.assertEqual(self.db.monitored_chat_ids(), {-30, -32})
+
+
+class ConfigEdgeTests(unittest.TestCase):
+    def test_scalar_values_and_yaml_errors(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = make_cfg(Path(d), "telegram:\n  exclude_chats: Семья\n  chats: 12345\n")
+            self.assertEqual((cfg.exclude_chats, cfg.all_chats, cfg.chats), (["Семья"], False, [12345]))
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(SystemExit) as err:
+            make_cfg(Path(d), "telegram:\n  chats: [\n")
+        self.assertIn("строка", str(err.exception))
+
+    def test_side_effect_fields_blocked(self):
+        with self.assertRaises(ReadOnlyViolation):
+            _assert_read_only(functions.contacts.ResolveUsernameRequest(username="x", referer="ref"))
+        _assert_read_only(functions.contacts.ResolveUsernameRequest(username="x"))
 
 
 class MigrationTests(unittest.TestCase):

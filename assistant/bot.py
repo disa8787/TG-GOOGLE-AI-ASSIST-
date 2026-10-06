@@ -19,7 +19,7 @@ from .telegram_archive import (
     forward_name,
     sync_chats,
 )
-from .util import fmt_local, split_text, utcnow
+from .util import fmt_local, from_db, split_text, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -172,7 +172,10 @@ async def run_app(cfg: Config) -> None:
     owner_id = cfg.owner_id or me.id
     chat_filter = ChatFilter(cfg, asst.db)
     chat_filter.apply_to_db(asst.db)
-    busy: set[int] = set()  # чаты, история которых сейчас скачивается
+    busy: set[int] = set()
+    # когда программа была в сети последний раз — до запуска «пульса», который эту отметку обновит
+    last_online = asst.db.get_kv("last_online")
+    online_since = from_db(last_online) if last_online else None  # чаты, история которых сейчас скачивается
 
     bot: TelegramClient | None = None
     if cfg.bot_token:
@@ -197,7 +200,7 @@ async def run_app(cfg: Config) -> None:
 
     async def initial_sync() -> None:
         try:
-            new = await sync_chats(user, asst.db, cfg, chat_filter, busy)
+            new = await sync_chats(user, asst.db, cfg, chat_filter, busy, online_since=online_since)
             log.info("Синхронизация завершена: новых сообщений %s", new)
             if new:
                 await notify(f"🔄 Докачал пропущенное: {new} новых сообщений.")

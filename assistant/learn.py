@@ -105,12 +105,19 @@ def build_plan(asst: Assistant, selected: set[int] | None) -> list[Chunk]:
 
 
 def nightly_scope(asst: Assistant) -> tuple[set[int], list[tuple[str, int, int]]]:
-    """Что можно изучать ночью без подтверждения: чаты, которые владелец уже одобрил ручным learn,
-    и небольшие новые чаты (до одной части). Крупная неизученная история откладывается до ручного learn —
-    возвращается списком (название, сообщений, символов)."""
+    """Что можно изучать ночью без подтверждения.
+
+    • Чаты, которые владелец одобрил ручным learn, — всё новое в них.
+    • Небольшие чаты, появившиеся в архиве ПОСЛЕ первого ручного learn (кто-то новый написал),
+      если их неизученное помещается в одну часть; суммарно на такие чаты — не больше одной части за ночь.
+    Всё остальное (чаты, которые владелец не выбирал, крупная история) откладывается до ручного learn и
+    возвращается списком (название, сообщений, символов) — чтобы сообщить владельцу.
+    """
     cfg, db = asst.cfg, asst.db
     eligible: set[int] = set()
     deferred: list[tuple[str, int, int]] = []
+    consent_at = db.get_kv("learn_started_at")
+    budget = cfg.learn_chunk_chars
     for chat in db.chats():
         if not chat["monitored"]:
             continue
@@ -121,8 +128,11 @@ def nightly_scope(asst: Assistant) -> tuple[set[int], list[tuple[str, int, int]]
         if not rows:
             continue
         chars = sum(len(_line(r, cfg.tz, False)) + 1 for r in rows)
-        if chars <= cfg.learn_chunk_chars:
+        new_since_consent = bool(consent_at and chat["added_at"] and chat["added_at"] > consent_at)
+        downloaded = chat["last_sync"] is not None
+        if new_since_consent and downloaded and chars <= budget:
             eligible.add(chat["chat_id"])
+            budget -= chars
         else:
             deferred.append((chat["title"] or str(chat["chat_id"]), len(rows), chars))
     return eligible, deferred
@@ -137,7 +147,9 @@ def _confirm(question: str) -> bool:
 
 async def learn_history(asst: Assistant, chat_filter: list[str] | None, model: str, yes: bool,
                         say: Say = print, max_chunks: int | None = None,
-                        only_chats: set[int] | None = None) -> bool:
+                        only_chats: set[int] | None = None, approve: bool = True) -> bool:
+    """approve=True — это ручной learn: изученные чаты считаются одобренными владельцем для ночного изучения.
+    Ночной запуск передаёт approve=False и одобрений не выдаёт."""
     cfg, db = asst.cfg, asst.db
     selected = None
     if chat_filter:
@@ -167,6 +179,8 @@ async def learn_history(asst: Assistant, chat_filter: list[str] | None, model: s
     if not yes and not _confirm("Продолжить? [y/N] "):
         say("Отменено.")
         return False
+    if approve and db.get_kv("learn_started_at") is None:
+        db.set_kv("learn_started_at", to_db(utcnow()))  # с этого момента новые чаты — «новые»
 
     for idx, chunk in enumerate(plan, 1):
         period = chunk.period(cfg.tz)
@@ -187,10 +201,11 @@ async def learn_history(asst: Assistant, chat_filter: list[str] | None, model: s
             db.upsert_memory(fact.get("category") or "прочее", fact["subject"], fact["content"], source="learn")
         if data.get("summary"):
             only = next(iter(chunk.rows)) if len(chunk.rows) == 1 else None
-            db.add_learn_note(only, period, data["summary"])
+            db.add_learn_note(only, period, data["summary"], chat_ids=list(chunk.rows))
         for chat_id, rows in chunk.rows.items():
             db.mark_learned([r["id"] for r in rows])
-            db.set_kv(f"learn_cursor:{chat_id}", "1")  # чат одобрен для изучения (ночью — без вопросов)
+            if approve:
+                db.set_kv(f"learn_cursor:{chat_id}", "1")  # одобрен владельцем — ночью изучается без вопросов
         say(f"    + {len(facts)} заметок, всего в памяти {db.memory_count()}")
     return True
 
@@ -232,7 +247,16 @@ async def learn_sheets(asst: Assistant, model: str, say: Say = print) -> None:
 async def build_profile(asst: Assistant, model: str, say: Say = print) -> bool:
     cfg, db = asst.cfg, asst.db
     titles = db.chat_titles()
-    notes = db.learn_notes()
+    monitored = db.monitored_chat_ids()
+
+    def visible(n) -> bool:
+        # изложения исключённых чатов в профиль не попадают
+        if n["chat_id"] is not None:
+            return n["chat_id"] in monitored
+        ids = [int(x) for x in (n["chat_ids"] or "").split(",") if x.strip().lstrip("-").isdigit()]
+        return all(i in monitored for i in ids)
+
+    notes = [n for n in db.learn_notes() if visible(n)]
     if not notes and not db.memory_count():
         say("Нечего обобщать — сначала скачай историю (download).")
         return False

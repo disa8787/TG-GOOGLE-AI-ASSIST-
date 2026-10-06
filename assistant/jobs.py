@@ -14,7 +14,7 @@ from .config import WEEKDAY_KEYS
 from .learn import build_profile, learn_history, nightly_scope
 from .llm import LLMError, estimate_cost
 from .telegram_archive import ChatFilter
-from .util import fmt_local, from_db, utcnow
+from .util import fmt_local, from_db, to_db, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +42,7 @@ class Scheduler:
             asyncio.create_task(self.report_loop(), name="report"),
             asyncio.create_task(self.watch_loop(), name="watch"),
             asyncio.create_task(self.nightly_loop(), name="nightly-learn"),
+            asyncio.create_task(self.heartbeat_loop(), name="heartbeat"),
         ]
 
     # ------------------------------------------------------------------ напоминания
@@ -145,7 +146,7 @@ class Scheduler:
         ChatFilter(self.cfg, self.db).apply_to_db(self.db)
         eligible, deferred = nightly_scope(self.asst)
         ok = await learn_history(self.asst, None, self.cfg.model, yes=True, say=say,
-                                 max_chunks=self.cfg.nightly_max_chunks, only_chats=eligible)
+                                 max_chunks=self.cfg.nightly_max_chunks, only_chats=eligible, approve=False)
         if ok and self.profile_due():
             await build_profile(self.asst, self.cfg.model, say=say)
         await self._report_backlog(deferred)
@@ -159,11 +160,12 @@ class Scheduler:
         cost = estimate_cost(self.cfg.model, int(chars / 2.5), int(chars / 2.5 / 10))
         names = ", ".join(f"«{t}» ({n})" for t, n, _ in deferred[:10])
         more = f" и ещё {len(deferred) - 10}" if len(deferred) > 10 else ""
-        await self._safe_notify(
+        sent = await self._safe_notify(
             f"📚 Есть неизученная история: {messages} сообщений в чатах {names}{more}. "
             f"Без твоего согласия я её не изучаю (≈ ${cost:.2f}). Изучить: assistant learn"
         )
-        self.db.set_kv("backlog_reported", key)
+        if sent:
+            self.db.set_kv("backlog_reported", key)
 
     async def nightly_loop(self) -> None:
         while True:
@@ -176,8 +178,21 @@ class Scheduler:
                 log.exception("Ошибка ночного изучения")
             await asyncio.sleep(60)
 
-    async def _safe_notify(self, text: str) -> None:
+    async def _safe_notify(self, text: str) -> bool:
         try:
             await self.notify(text)
+            return True
         except Exception:  # noqa: BLE001
             log.exception("Не удалось отправить уведомление")
+            return False
+
+    # ------------------------------------------------------------------ «программа в сети»
+    async def heartbeat_loop(self) -> None:
+        """Раз в минуту отмечает, что программа работает. При следующем запуске по этой отметке
+        видно, с какого момента компьютер был выключен — пришедшее после неё считается новым."""
+        while True:
+            try:
+                self.db.set_kv("last_online", to_db(utcnow()))
+            except Exception:  # noqa: BLE001
+                log.exception("Не удалось сохранить отметку «в сети»")
+            await asyncio.sleep(60)
