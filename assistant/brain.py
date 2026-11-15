@@ -13,8 +13,11 @@ from .llm import LLM, LLMError
 from .prompts import (
     KNOWLEDGE_TEMPLATE,
     NO_PROFILE,
+    OWNER_ABOUT,
+    OWNER_RULES,
     REPORT_REQUEST,
     SYSTEM_BASE,
+    TASK_REQUEST,
     WATCH_REQUEST,
 )
 from .sheets import Sheets
@@ -27,7 +30,8 @@ WATCH_PAYLOAD_CHARS = 60000
 WATCH_MAX_PASSES = 3
 
 
-PURPOSES = {"chat": "чат", "report": "отчёты", "watch": "фоновая проверка", "learn": "изучение истории"}
+PURPOSES = {"chat": "чат", "report": "отчёты", "watch": "фоновая проверка", "learn": "изучение истории",
+            "task": "задачи по расписанию"}
 
 
 def _num(value) -> str:
@@ -100,8 +104,14 @@ class Assistant:
         ) or "(не настроены)"
         name = self.db.get_kv("owner_name") or "имя пока неизвестно (выполни login/download)"
         owner = f"{name}. В архиве его сообщения подписаны «Я»."
+        notes = ""
+        if self.cfg.about:
+            notes += OWNER_ABOUT.format(about=self.cfg.about)
+        if self.cfg.instructions:
+            notes += OWNER_RULES.format(instructions=self.cfg.instructions)
         return KNOWLEDGE_TEMPLATE.format(
             owner=owner,
+            owner_notes=notes,
             profile=self.profile() or NO_PROFILE,
             sheets=sheets,
             count=self.db.memory_count(),
@@ -156,6 +166,19 @@ class Assistant:
         reports_dir.mkdir(exist_ok=True)
         path = reports_dir / f"{datetime.now(self.cfg.tz):%Y-%m-%d_%H%M}.md"
         path.write_text(answer, encoding="utf-8")
+        return answer
+
+    # ------------------------------------------------------------------ свои задачи по расписанию
+    async def scheduled_task(self, name: str, prompt: str) -> str:
+        async with self.lock:
+            text = f"{self.stamp()}\n" + TASK_REQUEST.format(name=name, prompt=prompt)
+            answer = await self.llm.run_agent(
+                purpose="task", system=self.system(), messages=[{"role": "user", "content": text}],
+                toolbox=self.tools, effort=self.cfg.effort_report,
+            )
+            self.db.add_report("task", f"{name}\n\n{answer}")
+            self.db.add_dialog("user", f"{self.stamp()}\n(автоматически) Задача по расписанию «{name}»: {prompt}")
+            self.db.add_dialog("assistant", answer)
         return answer
 
     # ------------------------------------------------------------------ фоновое наблюдение

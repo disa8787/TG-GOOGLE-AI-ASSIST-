@@ -51,7 +51,13 @@ async def cmd_login(cfg, _args) -> None:
 
 async def cmd_chats(cfg, args) -> None:
     from .db import DB
-    from .telegram_archive import FORBIDDEN_REASON, ChatFilter, chat_kind, connect_user, is_forbidden
+    from .telegram_archive import (
+        FORBIDDEN_REASON,
+        ChatFilter,
+        chat_kind,
+        connect_user,
+        is_forbidden,
+    )
 
     db = DB(cfg.data_dir / "assistant.db")
     archived = {r["chat_id"]: r["n"] for r in db.chats()}
@@ -256,6 +262,12 @@ async def cmd_status(cfg, _args) -> None:
     print(asst.usage_text().replace("**", ""))
 
 
+async def cmd_doctor(cfg, _args) -> None:
+    from .doctor import run_doctor
+
+    await run_doctor(cfg)
+
+
 # ---------------------------------------------------------------------- разбор аргументов
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="assistant", description="ИИ-ассистент: Telegram + Google Таблицы + Claude")
@@ -290,34 +302,78 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("chat", help="поговорить с ассистентом в консоли")
     sub.add_parser("run", help="основной режим: бот, отчёты, напоминания, наблюдение")
     sub.add_parser("status", help="состояние архива, памяти и расходов")
+    sub.add_parser("doctor", help="проверить всё: настройки, ключи, Telegram, бота, Claude, таблицы")
     return p
 
 
 COMMANDS = {
     "login": cmd_login, "chats": cmd_chats, "download": cmd_download, "sheets": cmd_sheets,
     "learn": cmd_learn, "report": cmd_report, "chat": cmd_chat, "run": cmd_run, "status": cmd_status,
+    "doctor": cmd_doctor,
 }
 
 
+TELEGRAM_COMMANDS = {"login", "chats", "download", "run"}  # работают с сессией Telegram — только по одной копии
+
+
+def _print_problem(text: str) -> None:
+    print(f"\n⚠️ {text}\n", flush=True)
+
+
 def main(argv: list[str] | None = None) -> None:
+    from .runtime import (
+        EXIT_CRASH,
+        EXIT_NEEDS_USER,
+        InstanceLock,
+        explain,
+        write_crash_log,
+    )
+
     args = build_parser().parse_args(argv)
     if args.command == "init":
         cmd_init(args)
         return
     if not (ROOT / "config.yaml").exists():
-        print("Нет config.yaml — сначала выполни: assistant init")
-        sys.exit(1)
-    cfg = load_config()
+        _print_problem("Нет config.yaml — сначала запусти install.bat (или: assistant init)")
+        sys.exit(EXIT_NEEDS_USER)
+    try:
+        cfg = load_config()
+    except SystemExit as e:
+        _print_problem(str(e.code))
+        sys.exit(EXIT_NEEDS_USER)
     setup_logging(cfg.data_dir, args.verbose)
     from .llm import LLMError
 
     try:
-        asyncio.run(COMMANDS[args.command](cfg, args))
+        if args.command in TELEGRAM_COMMANDS:
+            with InstanceLock(cfg.data_dir):
+                asyncio.run(COMMANDS[args.command](cfg, args))
+        else:
+            asyncio.run(COMMANDS[args.command](cfg, args))
     except KeyboardInterrupt:
         print("\nОстановлено.")
     except LLMError as e:
-        print(f"⚠️ {e}")
-        sys.exit(1)
+        _print_problem(str(e))
+        sys.exit(EXIT_NEEDS_USER)
+    except SystemExit as e:
+        if isinstance(e.code, str):
+            _print_problem(e.code)
+            sys.exit(EXIT_NEEDS_USER)
+        raise
+    except BaseException as e:  # noqa: BLE001 — последний рубеж: понятное сообщение и журнал сбоя
+        known = explain(e)
+        if known is not None:
+            message, needs_user = known
+            _print_problem(message)
+            if needs_user:
+                sys.exit(EXIT_NEEDS_USER)
+            write_crash_log(cfg.data_dir, e, args.command)
+            sys.exit(EXIT_CRASH)
+        path = write_crash_log(cfg.data_dir, e, args.command)
+        logging.getLogger(__name__).exception("Сбой")
+        _print_problem(f"Непредвиденная ошибка: {type(e).__name__}: {e}\n"
+                       f"Подробности сохранены в {path}. Проверка настроек: assistant.bat doctor")
+        sys.exit(EXIT_CRASH)
 
 
 if __name__ == "__main__":

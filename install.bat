@@ -38,5 +38,5 @@ if errorlevel 1 (
 .venv\Scripts\python -m assistant init
 echo.
 echo Готово! Теперь заполни файлы .env и config.yaml по инструкции из README.md,
-echo затем выполни:  assistant.bat login
+echo затем запусти doctor.bat (проверка), а потом start.bat
 pause

@@ -42,6 +42,7 @@ class Scheduler:
             asyncio.create_task(self.report_loop(), name="report"),
             asyncio.create_task(self.watch_loop(), name="watch"),
             asyncio.create_task(self.nightly_loop(), name="nightly-learn"),
+            asyncio.create_task(self.tasks_loop(), name="scheduled-tasks"),
         ]
 
     # ------------------------------------------------------------------ напоминания
@@ -89,6 +90,37 @@ class Scheduler:
                 await self._safe_notify(f"⚠️ Не удалось сделать ежедневный отчёт: {e}")
             except Exception:  # noqa: BLE001
                 log.exception("Ошибка при подготовке отчёта")
+            await asyncio.sleep(30)
+
+    # ------------------------------------------------------------------ свои задачи по расписанию
+    def task_due(self, task) -> bool:
+        now = datetime.now(self.cfg.tz)
+        if WEEKDAY_KEYS[now.weekday()] not in task.days or now.time() < _parse_hm(task.time):
+            return False
+        # если компьютер был выключен в нужное время — выполним сразу после запуска (в тот же день)
+        return self.db.get_kv(f"task_last:{task.name}") != now.date().isoformat()
+
+    async def run_due_tasks(self) -> int:
+        """Выполняет задачи, время которых подошло. Возвращает, сколько выполнено."""
+        done = 0
+        for task in self.cfg.schedule:
+            try:
+                if not self.task_due(task):
+                    continue
+                self.db.set_kv(f"task_last:{task.name}", datetime.now(self.cfg.tz).date().isoformat())
+                log.info("Задача по расписанию: %s", task.name)
+                answer = await self.asst.scheduled_task(task.name, task.prompt)
+                await self.notify(f"🗓 **{task.name}**\n\n{answer}")
+                done += 1
+            except LLMError as e:
+                await self._safe_notify(f"⚠️ Не удалось выполнить «{task.name}»: {e}")
+            except Exception:  # noqa: BLE001
+                log.exception("Ошибка задачи по расписанию «%s»", task.name)
+        return done
+
+    async def tasks_loop(self) -> None:
+        while True:
+            await self.run_due_tasks()
             await asyncio.sleep(30)
 
     # ------------------------------------------------------------------ наблюдение

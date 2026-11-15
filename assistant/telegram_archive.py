@@ -94,6 +94,77 @@ class ReadOnlyClient(TelegramClient):
         return await super()._call(sender, request, ordered=ordered, flood_sleep_threshold=flood_sleep_threshold)
 
 
+def _mtproxy_secret(secret: str) -> str:
+    """Секрет MTProto-прокси → hex, как ждёт Telethon (16 байт или dd + 16 байт)."""
+    import base64
+    import binascii
+
+    from .runtime import NeedsUser
+
+    raw = secret.strip()
+    try:
+        data = bytes.fromhex(raw)
+    except ValueError:
+        try:  # в ссылках секрет бывает в base64url
+            data = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+        except (binascii.Error, ValueError):
+            raise NeedsUser("telegram.proxy: не понял секрет MTProto-прокси") from None
+    if data[:1] == b"\xee":
+        raise NeedsUser("Этот MTProto-прокси (секрет начинается с ee, «маскировка под TLS») не поддерживается. "
+                        "Возьми прокси с секретом dd… или SOCKS5.")
+    if len(data) == 16 or (len(data) == 17 and data[0] == 0xDD):
+        return data.hex()
+    raise NeedsUser("telegram.proxy: секрет MTProto-прокси должен быть 16 байт (32 hex-символа) или dd + 16 байт")
+
+
+def proxy_settings(proxy: str) -> dict:
+    """telegram.proxy → параметры Telethon. Понимает socks5://, socks4://, http://, а также MTProto-прокси:
+    mtproxy://СЕКРЕТ@хост:порт или ссылки t.me/proxy?server=…&port=…&secret=… / tg://proxy?…"""
+    text = (proxy or "").strip()
+    if not text:
+        return {}
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    from telethon.network.connection import ConnectionTcpMTProxyRandomizedIntermediate
+
+    from .runtime import NeedsUser
+
+    url = urlparse(text)
+    scheme = url.scheme.lower()
+    query = parse_qs(url.query)
+    if "server" in query and "secret" in query:  # ссылка t.me/proxy или tg://proxy
+        host, port, secret = query["server"][0], query.get("port", ["443"])[0], query["secret"][0]
+        if not str(port).isdigit():
+            raise NeedsUser(f"telegram.proxy: неверный порт «{port}»")
+        return {"connection": ConnectionTcpMTProxyRandomizedIntermediate,
+                "proxy": (host, int(port), _mtproxy_secret(secret))}
+    if scheme in ("mtproxy", "mtproto"):
+        if not url.hostname or not url.port or not url.username:
+            raise NeedsUser("telegram.proxy: для MTProto нужен формат mtproxy://СЕКРЕТ@хост:порт")
+        return {"connection": ConnectionTcpMTProxyRandomizedIntermediate,
+                "proxy": (url.hostname, url.port, _mtproxy_secret(unquote(url.username)))}
+    if scheme in ("socks5", "socks4", "http", "https"):
+        if not url.hostname or not url.port:
+            raise NeedsUser("telegram.proxy: нужен адрес и порт, например socks5://127.0.0.1:1080")
+        try:
+            import python_socks  # noqa: F401
+        except ImportError:
+            raise NeedsUser("Для прокси нужна библиотека python-socks — запусти install.bat ещё раз.") from None
+        return {"proxy": {
+            "proxy_type": "http" if scheme.startswith("http") else scheme,
+            "addr": url.hostname, "port": url.port, "rdns": True,
+            "username": unquote(url.username) if url.username else None,
+            "password": unquote(url.password) if url.password else None,
+        }}
+    raise NeedsUser(f"telegram.proxy: не понял «{text}». Примеры: socks5://127.0.0.1:1080, "
+                    "mtproxy://СЕКРЕТ@хост:443 или ссылка t.me/proxy?server=…")
+
+
+def _client_kwargs(cfg: Config) -> dict:
+    # переподключаться терпеливо: ассистент работает сутками, связь иногда пропадает
+    return {"connection_retries": 10, "retry_delay": 3, "auto_reconnect": True, **proxy_settings(cfg.proxy)}
+
+
 def make_user_client(cfg: Config, read_only: bool = True) -> TelegramClient:
     if not cfg.api_id or not cfg.api_hash:
         raise SystemExit(
@@ -107,11 +178,32 @@ def make_user_client(cfg: Config, read_only: bool = True) -> TelegramClient:
         cfg.api_hash,
         device_model="TG AI Assistant (read-only)",
         system_version="local",
-        app_version="0.2",
+        app_version="0.3",
+        **_client_kwargs(cfg),
     )
     # при выгрузке длинной истории Telegram иногда просит подождать — ждём сами, не падаем
     client.flood_sleep_threshold = 24 * 3600
     return client
+
+
+CONNECT_TIMEOUT = 45  # секунд: если Telegram недоступен, соединение может «висеть» бесконечно
+
+
+async def connect_with_timeout(client: TelegramClient, what: str = "Telegram") -> None:
+    """Подключение с пределом ожидания и понятной ошибкой вместо бесконечного «висения»."""
+    try:
+        await asyncio.wait_for(client.connect(), CONNECT_TIMEOUT)
+    except (asyncio.TimeoutError, OSError) as e:
+        try:
+            await client.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        raise ConnectionError(f"Не удалось подключиться к {what} за {CONNECT_TIMEOUT} секунд") from e
+
+
+def make_bot_client(cfg: Config) -> TelegramClient:
+    """Клиент бота ассистента (через него ассистент пишет только владельцу)."""
+    return TelegramClient(str(cfg.data_dir / "bot"), cfg.api_id, cfg.api_hash, **_client_kwargs(cfg))
 
 
 def remember_owner(db: DB, me) -> None:
@@ -133,7 +225,8 @@ def login_hint() -> str:
 async def connect_user(cfg: Config, db: DB | None = None, interactive: bool = False) -> TelegramClient:
     """Подключает аккаунт владельца (только чтение). interactive=True — если не вошли, предложит войти."""
     client = make_user_client(cfg)
-    await client.connect()
+    print("Подключаюсь к Telegram…" + (" (через прокси)" if cfg.proxy else ""), flush=True)
+    await connect_with_timeout(client)
     if not await client.is_user_authorized():
         await client.disconnect()
         if not (interactive and sys.stdin is not None and sys.stdin.isatty()):
@@ -141,7 +234,7 @@ async def connect_user(cfg: Config, db: DB | None = None, interactive: bool = Fa
         print("Telegram-аккаунт ещё не подключён — давай войдём (это нужно один раз).\n")
         await login(cfg, db)
         client = make_user_client(cfg)
-        await client.connect()
+        await connect_with_timeout(client)
         if not await client.is_user_authorized():
             await client.disconnect()
             raise SystemExit(login_hint())
@@ -157,6 +250,7 @@ def _ask(prompt: str) -> str:
 async def login(cfg: Config, db: DB | None) -> None:
     # Вход — единственный момент, когда нужны «пишущие» запросы (отправка кода подтверждения)
     client = make_user_client(cfg, read_only=False)
+    await connect_with_timeout(client)
     print("Вход в твой Telegram (один раз). Код подтверждения придёт в приложение Telegram, в чат «Telegram».")
     await client.start(
         phone=cfg.phone or (lambda: _ask("Номер телефона в международном формате (например +79991234567): ")),

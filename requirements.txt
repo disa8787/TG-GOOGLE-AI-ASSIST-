@@ -6,3 +6,4 @@ croniter>=2.0
 python-dotenv>=1.0
 PyYAML>=6.0
 tzdata>=2024.1
+python-socks[asyncio]>=2.4

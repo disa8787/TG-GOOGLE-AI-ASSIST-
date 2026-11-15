@@ -27,6 +27,12 @@ class FakeBot:
     async def start(self, bot_token=None):
         return self
 
+    async def connect(self):
+        return None
+
+    async def disconnect(self):
+        return None
+
     def on(self, _event):
         def deco(fn):
             self.handler = fn
@@ -84,7 +90,7 @@ class StartupFlowTests(unittest.TestCase):
 
             fbot = FakeBot()
             bot_mod.connect_user = fake_connect
-            bot_mod.TelegramClient = lambda *a, **k: fbot
+            bot_mod.make_bot_client = lambda cfg_: fbot
 
             facts = {"summary": "Диспетчерская работа: грузы, водитель Иван", "facts": [
                 {"category": "водитель", "subject": "Водитель: Иван", "content": "Трак 101"}]}
@@ -112,6 +118,7 @@ class StartupFlowTests(unittest.TestCase):
                         break
                 self.assertEqual(app.phase, "ready")
                 await fbot.incoming("где Иван?")
+                app.stopping = True
                 fbot.stop.set()
                 await asyncio.wait_for(run, 5)
                 return app
@@ -148,7 +155,7 @@ class StartupFlowTests(unittest.TestCase):
                 return tg
             fbot = FakeBot()
             bot_mod.connect_user = fake_connect
-            bot_mod.TelegramClient = lambda *a, **k: fbot
+            bot_mod.make_bot_client = lambda cfg_: fbot
 
             async def scenario():
                 app = bot_mod.App(cfg)
@@ -161,6 +168,7 @@ class StartupFlowTests(unittest.TestCase):
                         break
                 self.assertEqual(app.phase, "ready", "обычный запуск — сразу в работу, докачка в фоне")
                 await asyncio.sleep(0.05)
+                app.stopping = True
                 fbot.stop.set()
                 await asyncio.wait_for(run, 5)
                 self.assertEqual(app.db.message_stats()["n"], 1, "пропущенное докачано в фоне")
@@ -188,7 +196,7 @@ class StartupFlowTests(unittest.TestCase):
                 return tg
             fbot = FakeBot()
             bot_mod.connect_user = fake_connect
-            bot_mod.TelegramClient = lambda *a, **k: fbot
+            bot_mod.make_bot_client = lambda cfg_: fbot
 
             async def scenario():
                 app = bot_mod.App(cfg)
@@ -197,6 +205,7 @@ class StartupFlowTests(unittest.TestCase):
                     await asyncio.sleep(0.01)
                     if app.phase == "ready":
                         break
+                app.stopping = True
                 fbot.stop.set()
                 await asyncio.wait_for(run, 5)
                 self.assertIsNone(app.db.get_kv("initial_download_done"), "в следующий раз попробуем снова")

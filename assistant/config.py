@@ -36,7 +36,14 @@ DEFAULTS: dict = {
         "download_media": False,
         "media_max_mb": 20,
         "reconcile_days": 3,
+        "proxy": "",
     },
+    "assistant": {
+        "about": "",
+        "instructions": "",
+    },
+    "commands": {},
+    "schedule": [],
     "privacy": {
         "mask_card_numbers": True,
     },
@@ -132,9 +139,31 @@ def _chat_selection(value) -> tuple[bool, list]:
     return False, items
 
 
+def _text_without_comments(value) -> str:
+    """Многострочный текст из config.yaml: строки, начинающиеся с #, — это примеры/комментарии, не текст."""
+    lines = [line for line in str(value or "").splitlines() if not line.lstrip().startswith("#")]
+    return "\n".join(lines).strip()
+
+
 def _local_tz_name() -> str:
     tz = datetime.now().astimezone().tzinfo
     return getattr(tz, "key", None) or "UTC"
+
+
+@dataclass
+class ScheduledTask:
+    """Своя задача по расписанию: в time по дням days ассистент выполняет prompt и присылает результат."""
+    name: str
+    time: str
+    days: list[str]
+    prompt: str
+
+
+# Встроенные команды бота — свои команды с такими именами не переопределяют их
+BUILTIN_COMMANDS = {
+    "start", "help", "report", "check", "reminders", "memory", "new", "download", "sync", "learn",
+    "learn_yes", "learn_no", "status", "usage",
+}
 
 
 @dataclass
@@ -204,6 +233,14 @@ class Config:
     profile_rebuild_days: int
     nightly_max_chunks: int
 
+    # Гибкая настройка под работу
+    proxy: str = ""
+    about: str = ""
+    instructions: str = ""
+    commands: dict[str, str] = field(default_factory=dict)
+    schedule: list[ScheduledTask] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
     @property
     def bot_id(self) -> int | None:
         """ID бота (первая часть токена) — чтобы не архивировать переписку с самим ботом."""
@@ -257,14 +294,48 @@ def load_config(root: Path = ROOT) -> Config:
 
     sheets = []
     for s in gg.get("sheets") or []:
-        if not s or not s.get("url"):
-            continue
+        if not s or not s.get("url") or "ВСТАВЬ" in str(s.get("url")).upper():
+            continue  # пустая запись или заглушка из примера — таблица не настроена
         sheets.append(SheetSource(
             name=str(s.get("name") or s["url"]),
             url=str(s["url"]).strip(),
             worksheets=[str(w) for w in (s.get("worksheets") or [])],
             description=str(s.get("description") or "").strip(),
         ))
+
+    warnings: list[str] = []
+    commands: dict[str, str] = {}
+    raw_commands = raw.get("commands") or {}
+    if not isinstance(raw_commands, dict):
+        warnings.append("commands: ожидается список вида «имя: что сделать» — пропущено")
+        raw_commands = {}
+    for name, prompt in raw_commands.items():
+        key = str(name).strip().lstrip("/").lower()
+        if not re.fullmatch(r"[a-z0-9_]{1,32}", key):
+            warnings.append(f"commands: «{name}» — имя команды только латиницей/цифрами/_, например free_drivers")
+            continue
+        if key in BUILTIN_COMMANDS:
+            warnings.append(f"commands: /{key} — встроенная команда, выбери другое имя")
+            continue
+        if not str(prompt or "").strip():
+            continue
+        commands[key] = str(prompt).strip()
+
+    schedule: list[ScheduledTask] = []
+    for i, item in enumerate(_as_list(raw.get("schedule")), 1):
+        if not isinstance(item, dict) or not str(item.get("prompt") or "").strip():
+            warnings.append(f"schedule: задача №{i} без prompt — пропущена")
+            continue
+        if item.get("enabled") is False:
+            continue
+        days = [str(d).lower()[:3] for d in _as_list(item.get("days")) or WEEKDAY_KEYS]
+        schedule.append(ScheduledTask(
+            name=str(item.get("name") or f"Задача {i}").strip(),
+            time=_hm(item.get("time"), "09:00"),
+            days=[d for d in days if d in WEEKDAY_KEYS] or list(WEEKDAY_KEYS),
+            prompt=str(item["prompt"]).strip(),
+        ))
+    assistant_cfg = raw.get("assistant") or {}
 
     hours = str(watch.get("active_hours") or "00:00-24:00").split("-")
     if len(hours) != 2:
@@ -322,4 +393,10 @@ def load_config(root: Path = ROOT) -> Config:
         nightly_time=_hm(lrn.get("time"), "03:30"),
         profile_rebuild_days=max(1, int(lrn.get("profile_rebuild_days") or 7)),
         nightly_max_chunks=max(1, int(lrn.get("nightly_max_chunks") or 20)),
+        proxy=str(tg.get("proxy") or "").strip(),
+        about=_text_without_comments(assistant_cfg.get("about")),
+        instructions=_text_without_comments(assistant_cfg.get("instructions")),
+        commands=commands,
+        schedule=schedule,
+        warnings=warnings,
     )

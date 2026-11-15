@@ -9,18 +9,21 @@ import sys
 import threading
 import time
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, functions, types
 
 from .brain import Assistant
 from .config import Config
 from .jobs import Scheduler
 from .learn import learn_estimate, learn_everything
 from .llm import LLMError
+from .runtime import last_crash
 from .telegram_archive import (
     ChatFilter,
     attach_live_listener,
     connect_user,
+    connect_with_timeout,
     forward_name,
+    make_bot_client,
     sync_chats,
 )
 from .util import fmt_local, from_db, split_text, to_db, utcnow
@@ -124,6 +127,7 @@ class App:
         self.download_task: asyncio.Task | None = None
         self.learn_task: asyncio.Task | None = None
         self.learn_decision: asyncio.Future | None = None
+        self.stopping = False  # штатная остановка (а не обрыв связи)
 
     # ------------------------------------------------------------------ уведомления
     async def notify(self, text: str) -> None:
@@ -310,7 +314,7 @@ class App:
             try:
                 # --- команды, которые работают всегда
                 if cmd in ("/start", "/help"):
-                    await send(bot, chat_id, self.status_prefix() + HELP)
+                    await send(bot, chat_id, self.status_prefix() + HELP + self.custom_help())
                     return
                 if cmd == "/status":
                     await send(bot, chat_id, self.status_prefix() + asst.status_text())
@@ -386,6 +390,10 @@ class App:
                         asyncio.create_task(wait_decision(self.learn_decision))
                         await send(bot, chat_id, self.learn_offer_text(est).replace(
                             " (или «да» в окне программы)", ""))
+                elif cmd[1:] in cfg.commands:
+                    prompt = cfg.commands[cmd[1:]] + (f"\n\nДополнительно: {arg}" if arg else "")
+                    answer = await run_with_typing(chat_id, asst.chat(prompt))
+                    await send(bot, chat_id, answer)
                 else:
                     blocks, notes = await read_attachments(bot, msg)
                     if msg.fwd_from:
@@ -400,6 +408,41 @@ class App:
             except Exception as e:  # noqa: BLE001
                 log.exception("Ошибка обработки сообщения")
                 await send(bot, chat_id, f"⚠️ Что-то пошло не так: {type(e).__name__}: {e}")
+
+    # ------------------------------------------------------------------ удобства
+    def custom_help(self) -> str:
+        if not self.cfg.commands:
+            return ""
+        lines = [f"/{name} — {prompt[:80]}{'…' if len(prompt) > 80 else ''}"
+                 for name, prompt in self.cfg.commands.items()]
+        return "\n\nТвои команды (config.yaml → commands):\n" + "\n".join(lines)
+
+    async def set_bot_menu(self) -> None:
+        """Меню команд в Telegram (кнопка «/» у поля ввода): встроенные + свои из config.yaml."""
+        builtin = [
+            ("report", "Отчёт прямо сейчас"), ("check", "Проверить новое сейчас"),
+            ("reminders", "Напоминания"), ("memory", "Что я помню"), ("new", "Новая тема"),
+            ("download", "Скачать/докачать историю"), ("learn", "Изучить историю"),
+            ("status", "Состояние"), ("usage", "Расходы"), ("help", "Что я умею"),
+        ]
+        custom = [(name, prompt[:60]) for name, prompt in self.cfg.commands.items()]
+        commands = [types.BotCommand(command=c, description=d) for c, d in (custom + builtin)[:100]]
+        try:
+            await self.bot(functions.bots.SetBotCommandsRequest(
+                scope=types.BotCommandScopeDefault(), lang_code="", commands=commands))
+        except Exception as e:  # noqa: BLE001 — меню не обязательно для работы
+            log.warning("Не удалось обновить меню команд бота: %s", e)
+
+    async def report_previous_crash(self) -> None:
+        """Если до этого запуска программа упала — сказать владельцу (start.bat перезапускает её сам)."""
+        crash = last_crash(self.cfg.data_dir)
+        if crash is None:
+            return
+        when, line = crash
+        if when <= float(self.db.get_kv("crash_reported") or 0):
+            return
+        self.db.set_kv("crash_reported", str(when))
+        await self.safe_notify(f"⚠️ Я перезапустился после сбоя: {line}\nПодробности — в файле data\\crash.log")
 
     # ------------------------------------------------------------------ запуск
     async def catch_up(self) -> None:
@@ -429,9 +472,11 @@ class App:
         self.chat_filter.apply_to_db(self.db)
 
         if cfg.bot_token:
-            self.bot = TelegramClient(str(cfg.data_dir / "bot"), cfg.api_id, cfg.api_hash)
+            self.bot = make_bot_client(cfg)
+            await connect_with_timeout(self.bot, "Telegram (бот)")
             await self.bot.start(bot_token=cfg.bot_token)
             self.register_bot_handlers()
+            await self.set_bot_menu()
         else:
             log.warning("BOT_TOKEN не задан — уведомления будут только в этом окне и в data/notifications.log. "
                         "От имени твоего аккаунта ассистент не пишет никогда.")
@@ -444,6 +489,12 @@ class App:
         try:
             mode = "все чаты" if cfg.all_chats else f"{len(cfg.chats)} выбранных чатов"
             print(f"Режим: {mode}. Твой Telegram — только чтение.", flush=True)
+            await self.report_previous_crash()
+            for warning in cfg.warnings:
+                print(f"⚠️ {warning}", flush=True)
+            if cfg.warnings:
+                await self.safe_notify("⚠️ В config.yaml есть ошибки, эти настройки пропущены:\n• "
+                                       + "\n• ".join(cfg.warnings))
 
             # 1) история: в самый первый раз — целиком и до запуска работы
             first_run = self.db.get_kv("initial_download_done") is None
@@ -460,7 +511,14 @@ class App:
                 self.tasks.append(asyncio.create_task(self.catch_up(), name="catch-up"))
             print("✅ Ассистент работает. Пиши боту в Telegram. Остановить — закрой окно или Ctrl+C.", flush=True)
             await self.safe_notify("✅ Я на связи и в курсе всего. /help — что я умею.")
-            await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            if self.stopping:
+                return
+            for t in done:
+                if not t.cancelled() and t.exception() is not None:
+                    raise t.exception()
+            # Telegram отключил и переподключиться не вышло — выходим со сбоем, start.bat перезапустит
+            raise ConnectionError("Связь с Telegram потеряна")
         finally:
             for t in self.tasks + waiters:
                 t.cancel()
