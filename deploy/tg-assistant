@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# Управление ассистентом на сервере. Ставится в /usr/local/bin скриптом deploy/install_server.sh.
+set -uo pipefail
+
+APP="/opt/tg-assistant"
+APP_USER=tg-assistant
+BACKUP_DIR="/var/backups/tg-assistant"
+SVC=tg-assistant
+PY="$APP/.venv/bin/python"
+KEEP_BACKUPS=14
+
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo "$0" "$@"  # всё ниже делается от root
+fi
+
+has_systemd() { [ -d /run/systemd/system ] && [ "${TG_NO_SYSTEMD:-0}" != "1" ]; }
+service_active() { has_systemd && systemctl is-active --quiet "$SVC"; }
+
+# запуск команды ассистента от имени служебного пользователя
+as_app() {
+    cd "$APP" || exit 1
+    runuser -u "$APP_USER" -- env ASSISTANT_SERVER=1 HOME="$APP" "$PY" -m assistant "$@"
+}
+
+# команды, которым нужна сессия Telegram, не могут работать параллельно со службой
+with_service_paused() {
+    local was_active=0
+    if service_active; then
+        was_active=1
+        echo "Останавливаю службу на время команды…"
+        systemctl stop "$SVC"
+    fi
+    as_app "$@"
+    local code=$?
+    if [ "$was_active" -eq 1 ] || [ "${1:-}" = "login" ]; then
+        if has_systemd; then
+            echo "Запускаю службу снова…"
+            systemctl start "$SVC"
+        fi
+    fi
+    return $code
+}
+
+backup() {
+    mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
+    local tmp ts out
+    tmp=$(mktemp -d)
+    ts=$(date +%Y-%m-%d_%H%M)
+    out="$BACKUP_DIR/tg-assistant-$ts.tar.gz"
+    # базы SQLite копируем «на ходу» без риска повредить: через встроенный механизм резервного копирования
+    "$PY" - "$APP/data" "$tmp" <<'PYEOF'
+import pathlib, sqlite3, sys
+src_dir, dst_dir = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+for path in list(src_dir.glob("*.db")) + list(src_dir.glob("*.session")):
+    src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    dst = sqlite3.connect(dst_dir / path.name)
+    src.backup(dst)
+    dst.close()
+    src.close()
+PYEOF
+    for f in "$APP/data/profile.md" "$APP/config.yaml" "$APP/.env"; do
+        [ -f "$f" ] && cp -a "$f" "$tmp/"
+    done
+    [ -d "$APP/credentials" ] && cp -a "$APP/credentials" "$tmp/"
+    tar -czf "$out" -C "$tmp" .
+    rm -rf "$tmp"
+    chmod 600 "$out"
+    ls -1t "$BACKUP_DIR"/tg-assistant-*.tar.gz 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | xargs -r rm -f
+    echo "Резервная копия: $out"
+    echo "(в ней доступ к твоему Telegram — не передавай её никому)"
+}
+
+usage() {
+    cat <<'EOF'
+tg-assistant — управление ассистентом на сервере
+
+  status        работает ли ассистент
+  logs          журнал в реальном времени (выход — Ctrl+C)
+  start | stop | restart
+  doctor        проверить всё: ключи, Telegram, бота, Claude, таблицы
+  config        изменить config.yaml (потом: tg-assistant restart)
+  env           изменить .env с ключами (потом: tg-assistant restart)
+  login         войти в Telegram заново (служба остановится на время входа)
+  chats         список чатов и что с каждым будет
+  download      скачать/докачать историю (служба остановится на время)
+  learn         изучить неизученную историю (покажет стоимость)
+  chat          поговорить с ассистентом прямо здесь
+  backup        резервная копия сейчас (делается и сама каждый день)
+  run           запустить в этом окне без службы (для отладки)
+EOF
+}
+
+cmd="${1:-help}"
+shift || true
+case "$cmd" in
+    start|stop|restart)
+        systemctl "$cmd" "$SVC" && systemctl --no-pager --lines=0 status "$SVC" | head -3 ;;
+    status)
+        if has_systemd; then systemctl --no-pager status "$SVC" | head -12; else echo "systemd нет — запускай: tg-assistant run"; fi
+        as_app status ;;
+    logs)
+        if has_systemd; then journalctl -u "$SVC" -f -n 200 -o cat; else tail -f "$APP/data/assistant.log"; fi ;;
+    doctor)
+        as_app doctor ;;
+    config)
+        "${EDITOR:-nano}" "$APP/config.yaml"
+        chown "$APP_USER:$APP_USER" "$APP/config.yaml"
+        echo "Чтобы применить: tg-assistant restart" ;;
+    env)
+        "${EDITOR:-nano}" "$APP/.env"
+        chown "$APP_USER:$APP_USER" "$APP/.env"; chmod 600 "$APP/.env"
+        echo "Чтобы применить: tg-assistant restart" ;;
+    login|chats|download)
+        with_service_paused "$cmd" "$@" ;;
+    learn|chat|report|sheets)
+        as_app "$cmd" "$@" ;;
+    run)
+        if service_active; then echo "Служба уже работает — сначала: tg-assistant stop"; exit 1; fi
+        as_app run ;;
+    backup)
+        backup ;;
+    help|-h|--help|*)
+        usage ;;
+esac

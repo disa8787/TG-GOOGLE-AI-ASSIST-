@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import shutil
 import sys
 from logging.handlers import RotatingFileHandler
@@ -316,6 +317,17 @@ COMMANDS = {
 TELEGRAM_COMMANDS = {"login", "chats", "download", "run"}  # работают с сессией Telegram — только по одной копии
 
 
+def _stop_on_sigterm() -> None:
+    """Служба на сервере останавливается сигналом SIGTERM — завершаемся так же аккуратно, как по Ctrl+C."""
+    import signal
+
+    if hasattr(signal, "SIGTERM") and os.name != "nt":
+        def handler(signum, frame):
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGTERM, handler)
+
+
 def _print_problem(text: str) -> None:
     print(f"\n⚠️ {text}\n", flush=True)
 
@@ -325,6 +337,7 @@ def main(argv: list[str] | None = None) -> None:
         EXIT_CRASH,
         EXIT_NEEDS_USER,
         InstanceLock,
+        check_not_moved,
         explain,
         write_crash_log,
     )
@@ -344,8 +357,10 @@ def main(argv: list[str] | None = None) -> None:
     setup_logging(cfg.data_dir, args.verbose)
     from .llm import LLMError
 
+    _stop_on_sigterm()
     try:
         if args.command in TELEGRAM_COMMANDS:
+            check_not_moved(cfg.data_dir)
             with InstanceLock(cfg.data_dir):
                 asyncio.run(COMMANDS[args.command](cfg, args))
         else:

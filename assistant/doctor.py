@@ -28,6 +28,12 @@ class Report:
         print(f"  ℹ️  {text}", flush=True)
 
 
+def how_to(action: str) -> str:
+    from .runtime import how_to as _how_to
+
+    return _how_to(action)
+
+
 def _err(e: BaseException) -> str:
     from .runtime import explain
 
@@ -45,7 +51,7 @@ async def check_telegram(cfg: Config, rep: Report) -> int | None:
     try:
         await connect_with_timeout(client)
         if not await client.is_user_authorized():
-            rep.line(False, "Telegram: вход ещё не выполнен", "запусти start.bat — он попросит номер и код")
+            rep.line(False, "Telegram: вход ещё не выполнен", f"выполни: {how_to('login')}")
             return None
         me = await client.get_me()
         rep.line(True, f"Telegram: вход выполнен — {me.first_name or ''} {me.last_name or ''}".rstrip())
@@ -146,7 +152,7 @@ def check_archive(cfg: Config, rep: Report) -> None:
         rep.info(f"Архив: {st['n']} сообщений в {len(chats)} чатах, изучено {learned}; "
                  f"заметок в памяти {db.memory_count()}")
         if not st["n"]:
-            rep.info("Архив пуст — при запуске start.bat история скачается")
+            rep.info(f"Архив пуст — при запуске ({how_to('start')}) история скачается")
         crash = last_crash(cfg.data_dir)
         if crash:
             rep.info(f"Последний сбой: {crash[1]} (data\\crash.log)")
@@ -155,7 +161,7 @@ def check_archive(cfg: Config, rep: Report) -> None:
 
 
 async def run_doctor(cfg: Config) -> bool:
-    from .runtime import InstanceLock, NeedsUser
+    from .runtime import InstanceLock, NeedsUser, on_server
     from .telegram_archive import proxy_settings
 
     rep = Report()
@@ -165,8 +171,13 @@ async def run_doctor(cfg: Config) -> bool:
     rep.line(sys.version_info >= (3, 10), f"Python {sys.version.split()[0]}", "нужен Python 3.10 или новее")
     rep.line(not cfg.warnings, "config.yaml прочитан" + (" — есть ошибки:" if cfg.warnings else ""),
              "; ".join(cfg.warnings))
-    rep.info(f"Часовой пояс {cfg.tz_name}; чаты: {'все' if cfg.all_chats else ', '.join(map(str, cfg.chats))}; "
-             f"модель {cfg.model}")
+    tz_set = bool(str(cfg.raw.get("timezone") or "").strip())
+    if on_server():
+        rep.line(tz_set, f"Часовой пояс: {cfg.tz_name}" if tz_set else "Часовой пояс не задан (на сервере это UTC)",
+                 f"укажи свой: {how_to('config')} → строка timezone, например Europe/Moscow")
+    else:
+        rep.info(f"Часовой пояс: {cfg.tz_name}" + ("" if tz_set else " (часовой пояс компьютера)"))
+    rep.info(f"Чаты: {'все' if cfg.all_chats else ', '.join(map(str, cfg.chats))}; модель {cfg.model}")
     if cfg.commands:
         rep.info("Свои команды: " + ", ".join(f"/{c}" for c in cfg.commands))
     if cfg.schedule:
@@ -202,5 +213,5 @@ async def run_doctor(cfg: Config) -> bool:
     if rep.problems:
         print(f"Нашлось проблем: {len(rep.problems)}. Исправь отмеченные ❌ и запусти проверку снова.")
     else:
-        print("Всё в порядке ✅ Запускай start.bat")
+        print(f"Всё в порядке ✅ Запуск: {how_to('start')}")
     return not rep.problems

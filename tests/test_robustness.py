@@ -47,7 +47,7 @@ class RuntimeTests(unittest.TestCase):
             (sqlite3.OperationalError("database is locked"), True, "другом окне"),
             (errors.AccessTokenInvalidError(request=None), True, "BOT_TOKEN"),
             (errors.ApiIdInvalidError(request=None), True, "TG_API_ID"),
-            (errors.AuthKeyUnregisteredError(request=None), True, "user.session"),
+            (errors.AuthKeyUnregisteredError(request=None), True, "Войди заново"),
             (ConnectionError("x"), False, "Нет связи"),
             (NeedsUser("сам"), True, "сам"),
         ]
@@ -232,6 +232,62 @@ class FlexibilityTests(unittest.TestCase):
                     app.db.conn.close()
         with self.assertRaises(ConnectionError):
             asyncio.run(scenario())
+
+
+class ServerModeTests(unittest.TestCase):
+    def test_hints_follow_where_it_runs(self):
+        from assistant.runtime import how_to
+        with mock.patch.dict("os.environ", {"ASSISTANT_SERVER": "1"}):
+            self.assertEqual(how_to("login"), "tg-assistant login")
+        with mock.patch.dict("os.environ", {"ASSISTANT_SERVER": ""}):
+            self.assertNotIn("tg-assistant", how_to("login"))
+
+    def test_moved_to_server_blocks_local_start(self):
+        root = make_root()
+        (root / "data").mkdir(exist_ok=True)
+        (root / "data" / "MOVED_TO_SERVER.txt").write_text("x", encoding="utf-8")
+        called = []
+
+        async def run(cfg, args):
+            called.append(1)
+        code, out = ExitCodeTests.run_main(self, root, ["run"], run)
+        self.assertEqual(code, EXIT_NEEDS_USER)
+        self.assertIn("перенесён на сервер", out)
+        self.assertEqual(called, [], "на компьютере не запускается")
+        with mock.patch.dict("os.environ", {"ASSISTANT_SERVER": "1"}):
+            code, _ = ExitCodeTests.run_main(self, root, ["run"], run)
+        self.assertEqual((code, called), (0, [1]), "на сервере метка не мешает")
+
+    def test_sigterm_is_a_clean_stop(self):
+        import os
+        import signal
+        import subprocess
+        import sys
+        import textwrap
+        root = make_root()
+        script = textwrap.dedent(f"""
+            import asyncio, sys
+            from unittest import mock
+            from pathlib import Path
+            import assistant.__main__ as cli
+            from assistant.config import load_config
+            root = Path({str(root)!r})
+            async def forever(cfg, args):
+                print("started", flush=True)
+                await asyncio.sleep(60)
+            patches = (mock.patch.object(cli, "ROOT", root),
+                       mock.patch.object(cli, "load_config", lambda: load_config(root)),
+                       mock.patch.dict(cli.COMMANDS, {{"status": forever}}))
+            with patches[0], patches[1], patches[2]:
+                cli.main(["status"])
+        """)
+        proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True,
+                                cwd=str(Path(__file__).resolve().parent.parent))
+        self.assertEqual(proc.stdout.readline().strip(), "started")
+        os.kill(proc.pid, signal.SIGTERM)
+        out, _ = proc.communicate(timeout=20)
+        self.assertEqual(proc.returncode, 0, "остановка службы — не сбой")
+        self.assertIn("Остановлено", out)
 
 
 class ProxyAndDoctorTests(unittest.TestCase):

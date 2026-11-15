@@ -2,3 +2,5 @@
 *.bat -text
 *.sh  text eol=lf
 *.py  text eol=lf
+*.service text eol=lf
+deploy/tg-assistant text eol=lf

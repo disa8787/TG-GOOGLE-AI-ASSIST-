@@ -216,10 +216,12 @@ def remember_owner(db: DB, me) -> None:
 
 
 def login_hint() -> str:
-    if os.name == "nt":
-        return ("Telegram-аккаунт не подключён. Открой папку программы, в адресной строке проводника "
-                "напиши cmd и нажми Enter, затем выполни:\n    assistant.bat login")
-    return "Telegram-аккаунт не подключён. Выполни:  ./assistant.sh login"
+    from .runtime import how_to, on_server
+
+    if os.name == "nt" and not on_server():
+        return ("Telegram-аккаунт не подключён. Запусти start.bat в обычном окне — он попросит номер и код.\n"
+                "Или в командной строке в папке программы: assistant.bat login")
+    return f"Telegram-аккаунт не подключён. Выполни: {how_to('login')}"
 
 
 async def connect_user(cfg: Config, db: DB | None = None, interactive: bool = False) -> TelegramClient:

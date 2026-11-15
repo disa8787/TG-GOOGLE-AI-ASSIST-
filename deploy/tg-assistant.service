@@ -1,0 +1,32 @@
+# Служба systemd: ассистент работает всегда, сам поднимается после сбоя и перезагрузки сервера.
+# Ставится скриптом deploy/install_server.sh. Управление: tg-assistant start|stop|restart|status|logs
+
+[Unit]
+Description=TG AI Assistant («второй я»)
+After=network-online.target
+Wants=network-online.target
+# не сдаваться, сколько бы раз ни пришлось перезапускать (например, при долгом отсутствии сети)
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=tg-assistant
+Group=tg-assistant
+WorkingDirectory=/opt/tg-assistant
+Environment=PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8 ASSISTANT_SERVER=1
+ExecStart=/opt/tg-assistant/.venv/bin/python -m assistant run
+# 1 — сбой: перезапуск через 30 секунд; 2 — нужна правка настроек/входа: не перезапускать вхолостую
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2
+TimeoutStopSec=20
+
+# защита: программа может писать только в свою папку data
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/tg-assistant/data
+
+[Install]
+WantedBy=multi-user.target

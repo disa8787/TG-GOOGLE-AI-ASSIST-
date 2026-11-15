@@ -19,6 +19,34 @@ EXIT_NEEDS_USER = 2
 CRASH_LOG = "crash.log"
 
 
+MOVED_MARKER = "MOVED_TO_SERVER.txt"  # ассистент перенесён на сервер — на этом компьютере не запускать
+
+
+def on_server() -> bool:
+    """Запущен как служба на сервере (deploy/install_server.sh задаёт ASSISTANT_SERVER=1)."""
+    return os.getenv("ASSISTANT_SERVER") == "1"
+
+
+def how_to(action: str) -> str:
+    """Как выполнить действие там, где сейчас работает программа: на сервере, в Windows или macOS/Linux."""
+    server = {"start": "tg-assistant start", "login": "tg-assistant login", "doctor": "tg-assistant doctor",
+              "config": "tg-assistant config"}
+    windows = {"start": "start.bat", "login": "start.bat (он сам попросит войти)", "doctor": "doctor.bat",
+               "config": "config.yaml в блокноте"}
+    unix = {"start": "./assistant.sh run", "login": "./assistant.sh login", "doctor": "./doctor.sh",
+            "config": "config.yaml в редакторе"}
+    table = server if on_server() else windows if os.name == "nt" else unix
+    return table.get(action, action)
+
+
+def check_not_moved(data_dir: Path) -> None:
+    marker = data_dir / MOVED_MARKER
+    if marker.exists() and not on_server():
+        raise NeedsUser("Ассистент перенесён на сервер и работает там. Два запуска с одним входом в Telegram "
+                        "ломают сессию, поэтому здесь он отключён. Чтобы снова запускать на этом компьютере — "
+                        f"сначала останови его на сервере (tg-assistant stop), потом удали файл {marker}.")
+
+
 class NeedsUser(Exception):
     """Ошибка, которую исправляет человек (настройки, ключи, вход) — перезапуск не поможет."""
 
@@ -43,8 +71,8 @@ def explain(exc: BaseException) -> tuple[str, bool] | None:
                     "и вставь целиком, без кавычек и пробелов."), True
         if isinstance(exc, (tg.AuthKeyUnregisteredError, tg.SessionRevokedError, tg.SessionExpiredError,
                             tg.AuthKeyDuplicatedError)):
-            return ("Сессия Telegram больше недействительна (вышли из устройства или вход с двух мест). "
-                    "Удали файл data\\user.session и запусти снова — программа попросит войти."), True
+            return ("Сессия Telegram больше недействительна (вышли из устройства или вход с двух мест одновременно). "
+                    f"Войди заново: {how_to('login')}"), True
         if isinstance(exc, (tg.UserDeactivatedError, tg.UserDeactivatedBanError, tg.PhoneNumberBannedError)):
             return "Telegram сообщает, что аккаунт заблокирован или удалён.", True
         if isinstance(exc, tg.PhoneNumberInvalidError):
