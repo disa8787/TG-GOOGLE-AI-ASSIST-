@@ -11,6 +11,7 @@ from .config import Config
 from .db import DB
 from .llm import LLM, LLMError
 from .prompts import (
+    ADVICE_REQUEST,
     KNOWLEDGE_TEMPLATE,
     NO_PROFILE,
     OWNER_ABOUT,
@@ -31,7 +32,7 @@ WATCH_MAX_PASSES = 3
 
 
 PURPOSES = {"chat": "чат", "report": "отчёты", "watch": "фоновая проверка", "learn": "изучение истории",
-            "task": "задачи по расписанию"}
+            "task": "задачи по расписанию", "advice": "разборы и советы"}
 
 
 def _num(value) -> str:
@@ -145,7 +146,7 @@ class Assistant:
             messages.append({"role": "user", "content": [*(extra_content or []), {"type": "text", "text": stamped}]})
             answer = await self.llm.run_agent(
                 purpose="chat", system=self.system(), messages=messages,
-                toolbox=self.tools, effort=self.cfg.effort_chat,
+                toolbox=self.tools, effort=self.cfg.effort_chat, web=True,
             )
             self.db.add_dialog("user", stamped)
             self.db.add_dialog("assistant", answer)
@@ -162,7 +163,7 @@ class Assistant:
             prompt = f"{self.stamp()}\n" + REPORT_REQUEST.format(instructions=self.cfg.report_instructions)
             answer = await self.llm.run_agent(
                 purpose="report", system=self.system(), messages=[{"role": "user", "content": prompt}],
-                toolbox=self.tools, effort=self.cfg.effort_report,
+                toolbox=self.tools, effort=self.cfg.effort_report, web=True,
             )
             self.db.add_report("daily", answer)
             self.db.add_dialog("user", f"{self.stamp()}\n(автоматически) Сделай ежедневный отчёт.")
@@ -173,13 +174,28 @@ class Assistant:
         path.write_text(answer, encoding="utf-8")
         return answer
 
+    # ------------------------------------------------------------------ разбор проблем и предложения
+    async def advice(self, focus: str = "") -> str:
+        """/advice: что горит, что может сорваться, где теряются время и деньги — и что с этим делать."""
+        async with self.lock:
+            request = ADVICE_REQUEST.format(focus=f"\nОсобое внимание: {focus}" if focus.strip() else "")
+            text = f"{self.stamp()}\n{request}"
+            answer = await self.llm.run_agent(
+                purpose="advice", system=self.system(), messages=[{"role": "user", "content": text}],
+                toolbox=self.tools, effort=self.cfg.effort_report, web=True,
+            )
+            # в диалог — чтобы можно было продолжить: «давай подробнее про второй пункт»
+            self.db.add_dialog("user", f"{self.stamp()}\nРазбери проблемы и предложи решения. {focus}".strip())
+            self.db.add_dialog("assistant", answer)
+        return answer
+
     # ------------------------------------------------------------------ свои задачи по расписанию
     async def scheduled_task(self, name: str, prompt: str) -> str:
         async with self.lock:
             text = f"{self.stamp()}\n" + TASK_REQUEST.format(name=name, prompt=prompt)
             answer = await self.llm.run_agent(
                 purpose="task", system=self.system(), messages=[{"role": "user", "content": text}],
-                toolbox=self.tools, effort=self.cfg.effort_report,
+                toolbox=self.tools, effort=self.cfg.effort_report, web=True,
             )
             self.db.add_report("task", f"{name}\n\n{answer}")
             self.db.add_dialog("user", f"{self.stamp()}\n(автоматически) Задача по расписанию «{name}»: {prompt}")
@@ -293,6 +309,7 @@ class Assistant:
             f"Таблиц настроено: {len(self.cfg.sheets)}",
             f"Активных напоминаний: {len(reminders)}",
             "Последний отчёт: " + (fmt_local(last_report[-1]["created_at"], self.cfg.tz) if last_report else "—"),
-            f"Модель: {self.cfg.model}",
+            f"Модель: {self.cfg.model}; поиск в интернете: "
+            + ("включён" if self.llm.web_available else "выключен (claude.web_search)"),
         ]
         return "\n".join(lines)

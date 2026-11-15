@@ -34,6 +34,8 @@ PRICES: dict[str, tuple[float, float, float]] = {
 FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
+WEB_SEARCH_PRICE = 0.01  # $10 за 1000 поисков (плюс токены найденных страниц)
+
 
 class LLMError(RuntimeError):
     """Понятная пользователю ошибка обращения к Claude."""
@@ -54,7 +56,8 @@ def usage_cost(model: str, usage) -> float:
     out = getattr(usage, "output_tokens", 0) or 0
     cr = getattr(usage, "cache_read_input_tokens", 0) or 0
     cw = getattr(usage, "cache_creation_input_tokens", 0) or 0
-    return (inp * pin + out * pout + cr * pread + cw * pin * 1.25) / 1_000_000
+    searches = getattr(getattr(usage, "server_tool_use", None), "web_search_requests", 0) or 0
+    return (inp * pin + out * pout + cr * pread + cw * pin * 1.25) / 1_000_000 + searches * WEB_SEARCH_PRICE
 
 
 def response_text(resp) -> str:
@@ -67,6 +70,13 @@ class LLM:
         self.db = db
         # ключ берётся из переменной окружения ANTHROPIC_API_KEY (файл .env)
         self.client = anthropic.AsyncAnthropic(max_retries=4)
+        # поиск в интернете (серверный инструмент Claude); выключается сам, если недоступен для ключа
+        self.web_available = cfg.web_search
+
+    def web_tools(self) -> list[dict]:
+        if not self.web_available:
+            return []
+        return [{"type": "web_search_20260209", "name": "web_search", "max_uses": self.cfg.web_search_max_uses}]
 
     # ------------------------------------------------------------------ низкоуровневый вызов
     def _model_params(self, model: str, effort: str | None, output_format: dict | None) -> dict:
@@ -180,6 +190,7 @@ class LLM:
         effort: str | None,
         model: str | None = None,
         on_tool: Callable[[str, dict], None] | None = None,
+        web: bool = False,
     ) -> str:
         """Цикл: Claude думает → вызывает инструменты → получает результаты → … → финальный ответ.
 
@@ -188,12 +199,25 @@ class LLM:
         """
         msgs = list(messages)
         max_steps = self.cfg.max_tool_steps
+        tools = toolbox.schemas + (self.web_tools() if web else [])
         for step in range(max_steps + 1):
             last_step = step == max_steps
-            resp = await self.call(
-                purpose=purpose, system=system, messages=msgs, model=model, effort=effort,
-                tools=toolbox.schemas, tool_choice={"type": "none"} if last_step else None,
-            )
+            try:
+                resp = await self.call(
+                    purpose=purpose, system=system, messages=msgs, model=model, effort=effort,
+                    tools=tools, tool_choice={"type": "none"} if last_step else None,
+                )
+            except LLMError as e:
+                # поиск в интернете может быть выключен для ключа/организации — тогда работаем без него
+                if step == 0 and len(tools) > len(toolbox.schemas) and "web" in str(e).lower():
+                    log.warning("Поиск в интернете недоступен (%s) — работаю без него", e)
+                    self.web_available = False
+                    tools = toolbox.schemas
+                    resp = await self.call(
+                        purpose=purpose, system=system, messages=msgs, model=model, effort=effort, tools=tools,
+                    )
+                else:
+                    raise
             if resp.stop_reason == "refusal":
                 return "⚠️ Модель отказалась отвечать на этот запрос. Попробуй переформулировать."
             msgs.append({"role": "assistant", "content": resp.content})

@@ -67,7 +67,9 @@ DEFAULTS: dict = {
         "effort_learn": "high",
         "effort_watch": "low",
         "fallbacks": True,
-        "max_tool_steps": 30,
+        "max_tool_steps": 50,
+        "web_search": True,
+        "web_search_max_uses": 5,
     },
     "report": {
         "enabled": True,
@@ -186,6 +188,11 @@ def _days(value, where: str, warnings: list[str]) -> list[str]:
     return [d for d in WEEKDAY_KEYS if d in days] or list(WEEKDAY_KEYS)
 
 
+def _legacy(section: str, key: str, value: int) -> int:
+    old, new = LEGACY_DEFAULTS[(section, key)]
+    return new if value == old else value
+
+
 ALL_WORDS = {"all", "все", "всё", "*"}
 # заглушка из первой версии config.example.yaml — если её не заменили, значит берём все чаты
 PLACEHOLDER_CHATS = {"название рабочего чата"}
@@ -236,8 +243,12 @@ class ScheduledTask:
 # Встроенные команды бота — свои команды с такими именами не переопределяют их
 BUILTIN_COMMANDS = {
     "start", "help", "report", "check", "reminders", "memory", "new", "download", "sync", "learn",
-    "learn_yes", "learn_no", "status", "usage",
+    "learn_yes", "learn_no", "status", "usage", "advice",
 }
+
+# Значения из старых версий config.example.yaml, которые теперь шире. Если владелец их не менял
+# (стоит ровно старое значение по умолчанию) — берём новое.
+LEGACY_DEFAULTS = {("claude", "max_tool_steps"): (30, 50)}
 
 
 @dataclass
@@ -288,6 +299,8 @@ class Config:
     effort_watch: str
     fallbacks: bool
     max_tool_steps: int
+    web_search: bool
+    web_search_max_uses: int
 
     # Расписание
     report_enabled: bool
@@ -460,7 +473,11 @@ def load_config(root: Path = ROOT) -> Config:
         effort_learn=str(cl["effort_learn"]),
         effort_watch=str(cl["effort_watch"]),
         fallbacks=_bool(cl.get("fallbacks"), True, "claude.fallbacks", w),
-        max_tool_steps=_int(cl.get("max_tool_steps") or 30, 30, "claude.max_tool_steps", w, minimum=2),
+        max_tool_steps=_legacy("claude", "max_tool_steps",
+                               _int(cl.get("max_tool_steps") or 50, 50, "claude.max_tool_steps", w, minimum=2)),
+        web_search=_bool(cl.get("web_search"), True, "claude.web_search", w),
+        web_search_max_uses=_int(cl.get("web_search_max_uses") or 5, 5, "claude.web_search_max_uses", w,
+                                 minimum=1),
         report_enabled=_bool(rep.get("enabled"), True, "report.enabled", w),
         report_time=_hm(rep.get("time"), "08:00"),
         report_days=_days(rep.get("days"), "report.days", w),

@@ -94,7 +94,8 @@ class StartupFlowTests(unittest.TestCase):
 
             facts = {"summary": "Диспетчерская работа: грузы, водитель Иван", "facts": [
                 {"category": "водитель", "subject": "Водитель: Иван", "content": "Трак 101"}]}
-            client, fake = fake_client([text_resp(json.dumps(facts, ensure_ascii=False)),
+            client, fake = fake_client([text_resp("По архиву: Иван — трак 101."),
+                                        text_resp(json.dumps(facts, ensure_ascii=False)),
                                         text_resp("Ты диспетчер грузоперевозок. Водитель Иван, трак 101."),
                                         text_resp("Иван — водитель, трак 101.")])
 
@@ -102,15 +103,17 @@ class StartupFlowTests(unittest.TestCase):
                 app = bot_mod.App(cfg)
                 app.asst.llm.client = client
                 run = asyncio.create_task(app.run())
-                # пока идёт первый этап, бот отвечает статусом, а не Claude
+                # пока скачивается история, бот отвечает статусом; когда скачана — уже отвечает по архиву
                 for _ in range(200):
                     await asyncio.sleep(0.01)
                     if app.phase == "learn" and app.learn_decision is not None:
                         break
                 self.assertEqual(app.db.message_stats()["n"], 30, "вся история скачана ДО работы")
+                self.assertEqual(len(fake.calls), 0, "до согласия на изучение Claude ничего не изучает")
                 await fbot.incoming("где Иван?")
-                self.assertIn("изучаю историю", fbot.sent[-1])
-                self.assertEqual(len(fake.calls), 0, "до согласия на изучение Claude не вызывается")
+                self.assertIn("отвечаю по архиву", fbot.sent[-1])
+                self.assertIn("Иван — трак 101", fbot.sent[-1])
+                await fbot.incoming("/learn")  # повторный вопрос не должен «потерять» первый
                 await fbot.incoming("/learn_yes")
                 for _ in range(300):
                     await asyncio.sleep(0.01)

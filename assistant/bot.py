@@ -31,7 +31,8 @@ from .util import fmt_local, from_db, split_text, to_db, utcnow
 log = logging.getLogger(__name__)
 
 HELP = """\
-Я — твой «второй я»: знаю всё из твоего Telegram, таблиц и памяти и ничего не забываю. \
+Я — твой «второй я»: знаю всё из твоего Telegram, таблиц и памяти, ничего не забываю, замечаю проблемы \
+и предлагаю, как их решить. Могу поискать в интернете (погода, дороги, брокеры, правила). \
 От твоего имени я ничего не пишу — твой Telegram для меня только на чтение.
 
 Пиши вопросы обычным текстом, например:
@@ -41,11 +42,14 @@ HELP = """\
 • Кто ждёт от меня ответа?
 • Напомни в 15:00 запросить апдейт у Сергея
 • Набросай ответ брокеру по грузу 12345 — как бы написал я
+• Водитель опаздывает на выгрузку на 3 часа — что делать?
+• Как лучше поторговаться с брокером по этому грузу?
 • Запомни: у Петра трак 512, он не ездит в Нью-Йорк
 
 Можно присылать фото и PDF (рейт-коны, BOL, скриншоты) и пересылать сообщения из чатов.
 
 Команды:
+/advice [тема] — разбор: что горит, что может сорваться и что с этим делать
 /report — сделать отчёт прямо сейчас
 /check — проверить новые сообщения и таблицы сейчас
 /reminders — активные напоминания
@@ -364,11 +368,14 @@ class App:
                     self._decide(cmd == "/learn_yes")
                     await send(bot, chat_id, "Начинаю изучать историю…" if cmd == "/learn_yes" else "Ок, отложил.")
                     return
-                if self.phase != "ready":
-                    # история ещё не скачана/не изучена — отвечать по ней рано
+                if self.phase in ("starting", "download"):
+                    # история ещё не скачана — отвечать по ней рано
                     await send(bot, chat_id, self.status_prefix() + "Как закончу — напишу. "
                                "Можно посмотреть /status или расходы /usage.")
                     return
+                # история скачана, но ещё не изучена — отвечаю по архиву, честно предупреждая об этом
+                note = ("⏳ Историю ещё не изучил до конца — отвечаю по архиву переписки.\n\n"
+                        if self.phase == "learn" else "")
 
                 # --- обычная работа
                 if cmd == "/report":
@@ -392,6 +399,10 @@ class App:
                             f"#{r['id']} **{r['subject']}** ({r['category']}, "
                             f"{fmt_local(r['updated_at'], cfg.tz)[:10]})\n{r['content']}" for r in rows)
                         await send(bot, chat_id, f"{head}\n\n{body}")
+                elif cmd == "/advice":
+                    await send(bot, chat_id, "Разбираю переписку, таблицы и память — пара минут…")
+                    answer = await run_with_typing(chat_id, asst.advice(arg))
+                    await send(bot, chat_id, note + "🧭 **Проблемы и решения**\n\n" + answer)
                 elif cmd == "/new":
                     asst.reset_dialog()
                     await send(bot, chat_id, "Ок, начинаем с чистого листа. Память и архив на месте.")
@@ -418,6 +429,10 @@ class App:
                     est = learn_estimate(self.asst)
                     if est["parts"] == 0:
                         await send(bot, chat_id, "Вся скачанная история уже изучена ✅")
+                    elif self.learn_decision is not None and not self.learn_decision.done():
+                        # уже спросил и жду ответа — не заводим второй вопрос (первый бы «потерялся»)
+                        await send(bot, chat_id, self.learn_offer_text(est).replace(
+                            " (или «да» в окне программы)", ""))
                     else:
                         self.learn_decision = asyncio.get_running_loop().create_future()
 
@@ -430,7 +445,7 @@ class App:
                 elif cmd[1:] in cfg.commands:
                     prompt = cfg.commands[cmd[1:]] + (f"\n\nДополнительно: {arg}" if arg else "")
                     answer = await run_with_typing(chat_id, asst.chat(prompt))
-                    await send(bot, chat_id, answer)
+                    await send(bot, chat_id, note + answer)
                 else:
                     blocks, notes = await read_attachments(bot, msg)
                     if msg.fwd_from:
@@ -439,7 +454,7 @@ class App:
                     if not full and not blocks:
                         return
                     answer = await run_with_typing(chat_id, asst.chat(full or "(вложение)", blocks))
-                    await send(bot, chat_id, answer)
+                    await send(bot, chat_id, note + answer)
             except LLMError as e:
                 await send(bot, chat_id, f"⚠️ {e}")
             except Exception as e:  # noqa: BLE001
@@ -457,7 +472,8 @@ class App:
     async def set_bot_menu(self) -> None:
         """Меню команд в Telegram (кнопка «/» у поля ввода): встроенные + свои из config.yaml."""
         builtin = [
-            ("report", "Отчёт прямо сейчас"), ("check", "Проверить новое сейчас"),
+            ("advice", "Проблемы и решения"), ("report", "Отчёт прямо сейчас"),
+            ("check", "Проверить новое сейчас"),
             ("reminders", "Напоминания"), ("memory", "Что я помню"), ("new", "Новая тема"),
             ("download", "Скачать/докачать историю"), ("learn", "Изучить историю"),
             ("status", "Состояние"), ("usage", "Расходы"), ("help", "Что я умею"),
