@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -15,6 +16,7 @@ from .prompts import (
     PROFILE_SYSTEM,
     SHEETS_SYSTEM,
 )
+from .runtime import FileLock, NeedsUser
 from .sheets import format_table, normalize
 from .telegram_archive import ChatFilter
 from .util import fmt_local, mask_cards, to_db, truncate, utcnow
@@ -195,7 +197,7 @@ async def learn_history(asst: Assistant, chat_filter: list[str] | None, model: s
                 effort=cfg.effort_learn, model=model,
             )
         except LLMError as e:
-            say(f"⚠️ {e}\nПрогресс сохранён — запусти learn ещё раз, чтобы продолжить с этого места.")
+            say(f"⚠️ {e}\nПрогресс сохранён — запусти изучение ещё раз (/learn), чтобы продолжить с этого места.")
             return False
         facts = [f for f in data.get("facts", []) if f.get("subject") and f.get("content")]
         for fact in facts:
@@ -319,21 +321,51 @@ def learn_estimate(asst: Assistant, model: str | None = None) -> dict:
     }
 
 
+class LearnBusy(Exception):
+    """Изучение уже идёт (в боте, ночью или в другой команде). Второе параллельно не запускаем —
+    иначе одни и те же сообщения ушли бы в Claude дважды и стоили бы вдвое дороже."""
+
+
+@contextlib.asynccontextmanager
+async def learning_guard(asst: Assistant):
+    if asst.learn_lock.locked():
+        raise LearnBusy("Изучение уже идёт — дождись конца (что сейчас делаю: /status)")
+    async with asst.learn_lock:
+        file_lock = FileLock(asst.cfg.data_dir / "learn.lock")
+        if not file_lock.try_acquire():
+            raise LearnBusy("Изучение уже идёт в другой команде (например, learn в соседнем окне) — "
+                            "дождись её конца")
+        try:
+            yield
+        finally:
+            file_lock.release()
+
+
 async def learn_everything(asst: Assistant, say: Say, model: str | None = None) -> bool:
     """Изучить всю неизученную историю, таблицы и составить профиль — владелец уже подтвердил стоимость."""
     model = model or asst.cfg.model
-    ChatFilter(asst.cfg, asst.db).apply_to_db(asst.db)
-    ok = await learn_history(asst, None, model, yes=True, say=say)
-    if not ok:
-        return False
-    await learn_sheets(asst, model, say=say)
-    await build_profile(asst, model, say=say)
-    return True
+    async with learning_guard(asst):
+        ChatFilter(asst.cfg, asst.db).apply_to_db(asst.db)
+        ok = await learn_history(asst, None, model, yes=True, say=say)
+        if not ok:
+            return False
+        await learn_sheets(asst, model, say=say)
+        await build_profile(asst, model, say=say)
+        return True
 
 
 async def run_learn(asst: Assistant, *, chats: list[str] | None, reset: bool, yes: bool,
                     sheets_only: bool, model: str | None) -> None:
     model = model or asst.cfg.model
+    try:
+        async with learning_guard(asst):
+            await _run_learn(asst, chats=chats, reset=reset, yes=yes, sheets_only=sheets_only, model=model)
+    except LearnBusy as e:
+        raise NeedsUser(str(e)) from None
+
+
+async def _run_learn(asst: Assistant, *, chats: list[str] | None, reset: bool, yes: bool,
+                     sheets_only: bool, model: str) -> None:
     # исключения из config.yaml применяем и к уже скачанному — исключённое не уходит в Claude
     ChatFilter(asst.cfg, asst.db).apply_to_db(asst.db)
     if reset:

@@ -23,8 +23,12 @@ def setup_logging(data_dir, verbose: bool) -> None:
     console.setLevel(logging.DEBUG if verbose else logging.INFO)
     root = logging.getLogger()
     root.setLevel(logging.INFO)
-    root.addHandler(file_handler)
-    root.addHandler(console)
+    for old in [h for h in root.handlers if getattr(h, "_assistant", False)]:
+        root.removeHandler(old)  # повторный вызов (тесты) не дублирует строки журнала
+        old.close()
+    for handler in (file_handler, console):
+        handler._assistant = True
+        root.addHandler(handler)
     for noisy in ("telethon", "httpx", "httpx2", "httpcore", "anthropic", "urllib3", "google"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
@@ -269,6 +273,20 @@ async def cmd_doctor(cfg, _args) -> None:
     await run_doctor(cfg)
 
 
+async def cmd_prepare_move(cfg, _args) -> None:
+    """Перед переносом на сервер (upload_to_server.bat): ассистент здесь должен быть закрыт (это проверяет
+    блокировка), а база — сведена в один файл, чтобы копия архива была целой."""
+    import sqlite3
+
+    for path in sorted(cfg.data_dir.glob("*.db")):
+        conn = sqlite3.connect(str(path))
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+    print("Готово к переносу: ассистент на этом компьютере не запущен, архив сохранён целиком.")
+
+
 # ---------------------------------------------------------------------- разбор аргументов
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="assistant", description="ИИ-ассистент: Telegram + Google Таблицы + Claude")
@@ -304,17 +322,77 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("run", help="основной режим: бот, отчёты, напоминания, наблюдение")
     sub.add_parser("status", help="состояние архива, памяти и расходов")
     sub.add_parser("doctor", help="проверить всё: настройки, ключи, Telegram, бота, Claude, таблицы")
+    sub.add_parser("prepare-move", help="подготовить данные к переносу на сервер (вызывает upload_to_server.bat)")
     return p
 
 
 COMMANDS = {
     "login": cmd_login, "chats": cmd_chats, "download": cmd_download, "sheets": cmd_sheets,
     "learn": cmd_learn, "report": cmd_report, "chat": cmd_chat, "run": cmd_run, "status": cmd_status,
-    "doctor": cmd_doctor,
+    "doctor": cmd_doctor, "prepare-move": cmd_prepare_move,
 }
 
 
 TELEGRAM_COMMANDS = {"login", "chats", "download", "run"}  # работают с сессией Telegram — только по одной копии
+LOCKED_COMMANDS = TELEGRAM_COMMANDS | {"prepare-move"}
+
+
+def _stuck_message(exc: BaseException) -> str | None:
+    """Если программа остановилась и сама не поднимется (нужен вход, ключ, правка настроек) — что сказать."""
+    from .llm import LLMError
+    from .runtime import AlreadyRunning, explain
+
+    if isinstance(exc, (KeyboardInterrupt, AlreadyRunning)):
+        return None  # остановили сами / работает другая копия — с ней всё в порядке
+    if isinstance(exc, LLMError):
+        return str(exc)
+    if isinstance(exc, SystemExit):
+        return exc.code if isinstance(exc.code, str) else None
+    known = explain(exc)
+    return known[0] if known and known[1] else None
+
+
+def _tell_owner(cfg, text: str) -> bool:
+    """Сообщение владельцу через бота, когда основной режим уже не работает. На сервере окно с ошибкой
+    никто не видит — без этого ассистент молча стоял бы, пока владелец не заметит."""
+    if not cfg.bot_token:
+        return False
+
+    async def go() -> bool:
+        from .db import DB
+        from .telegram_archive import make_bot_client
+
+        owner = cfg.owner_id
+        if not owner:
+            db = DB(cfg.data_dir / "assistant.db")
+            try:
+                owner = int(db.get_kv("owner_tg_id") or 0)
+            finally:
+                db.conn.close()
+        if not owner:
+            return False
+        bot = make_bot_client(cfg)
+        try:
+            await asyncio.wait_for(bot.start(bot_token=cfg.bot_token), 30)
+            await asyncio.wait_for(bot.send_message(owner, text, link_preview=False), 30)
+            return True
+        finally:
+            await bot.disconnect()
+
+    try:
+        return asyncio.run(go())
+    except BaseException:  # noqa: BLE001 — сообщить не вышло (нет сети, неверный токен) — остаётся журнал
+        logging.getLogger(__name__).warning("Не удалось сообщить владельцу через бота", exc_info=True)
+        return False
+
+
+def _report_stuck(cfg, exc: BaseException) -> None:
+    from .runtime import how_to
+
+    message = _stuck_message(exc)
+    if message:
+        _tell_owner(cfg, f"⛔ Я остановился и сам не запущусь — нужна твоя помощь:\n{message}\n\n"
+                         f"Когда исправишь — запусти снова: {how_to('start')}")
 
 
 def _stop_on_sigterm() -> None:
@@ -359,10 +437,16 @@ def main(argv: list[str] | None = None) -> None:
 
     _stop_on_sigterm()
     try:
-        if args.command in TELEGRAM_COMMANDS:
-            check_not_moved(cfg.data_dir)
+        if args.command in LOCKED_COMMANDS:
+            if args.command in TELEGRAM_COMMANDS:
+                check_not_moved(cfg.data_dir)
             with InstanceLock(cfg.data_dir):
-                asyncio.run(COMMANDS[args.command](cfg, args))
+                try:
+                    asyncio.run(COMMANDS[args.command](cfg, args))
+                except BaseException as e:
+                    if args.command == "run":
+                        _report_stuck(cfg, e)  # пока держим блокировку: сессию бота никто не трогает
+                    raise
         else:
             asyncio.run(COMMANDS[args.command](cfg, args))
     except KeyboardInterrupt:

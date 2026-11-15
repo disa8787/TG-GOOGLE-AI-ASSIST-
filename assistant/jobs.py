@@ -11,7 +11,13 @@ from croniter import croniter
 
 from .brain import Assistant
 from .config import WEEKDAY_KEYS
-from .learn import build_profile, learn_history, nightly_scope
+from .learn import (
+    LearnBusy,
+    build_profile,
+    learn_history,
+    learning_guard,
+    nightly_scope,
+)
 from .llm import LLMError, estimate_cost
 from .telegram_archive import ChatFilter
 from .util import fmt_local, from_db, to_db, utcnow
@@ -172,14 +178,20 @@ class Scheduler:
         """
         say = log.info
         if not self.db.learning_started():
-            say("Ночное изучение пропущено: сначала запусти «assistant learn» (там видна стоимость).")
+            say("Ночное изучение пропущено: первое изучение запускает владелец (/learn — там видна стоимость).")
             return
-        ChatFilter(self.cfg, self.db).apply_to_db(self.db)
-        eligible, deferred = nightly_scope(self.asst)
-        ok = await learn_history(self.asst, None, self.cfg.model, yes=True, say=say,
-                                 max_chunks=self.cfg.nightly_max_chunks, only_chats=eligible, approve=False)
-        if ok and self.profile_due():
-            await build_profile(self.asst, self.cfg.model, say=say)
+        try:
+            async with learning_guard(self.asst):
+                ChatFilter(self.cfg, self.db).apply_to_db(self.db)
+                eligible, deferred = nightly_scope(self.asst)
+                ok = await learn_history(self.asst, None, self.cfg.model, yes=True, say=say,
+                                         max_chunks=self.cfg.nightly_max_chunks, only_chats=eligible,
+                                         approve=False)
+                if ok and self.profile_due():
+                    await build_profile(self.asst, self.cfg.model, say=say)
+        except LearnBusy as e:
+            say(f"Ночное изучение пропущено: {e}")
+            return
         await self._report_backlog(deferred)
 
     async def _report_backlog(self, deferred: list[tuple[str, int, int]]) -> None:
@@ -193,7 +205,7 @@ class Scheduler:
         more = f" и ещё {len(deferred) - 10}" if len(deferred) > 10 else ""
         sent = await self._safe_notify(
             f"📚 Есть неизученная история: {messages} сообщений в чатах {names}{more}. "
-            f"Без твоего согласия я её не изучаю (≈ ${cost:.2f}). Изучить: assistant learn"
+            f"Без твоего согласия я её не изучаю (≈ ${cost:.2f}). Изучить — /learn (сначала покажу стоимость)"
         )
         if sent:
             self.db.set_kv("backlog_reported", key)

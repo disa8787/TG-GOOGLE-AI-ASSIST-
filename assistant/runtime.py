@@ -17,6 +17,7 @@ EXIT_CRASH = 1
 EXIT_NEEDS_USER = 2
 
 CRASH_LOG = "crash.log"
+CRASH_LOG_MAX_BYTES = 1_000_000  # журнал сбоев не растёт бесконечно, если сбой повторяется
 
 
 MOVED_MARKER = "MOVED_TO_SERVER.txt"  # ассистент перенесён на сервер — на этом компьютере не запускать
@@ -39,6 +40,14 @@ def how_to(action: str) -> str:
     return table.get(action, action)
 
 
+def data_file_hint(name: str) -> str:
+    """Где лежит файл из папки data — так, как его найдёт владелец (на сервере — полный путь)."""
+    if on_server():
+        from .config import ROOT
+        return str(ROOT / "data" / name)
+    return f"data\\{name}" if os.name == "nt" else f"data/{name}"
+
+
 def check_not_moved(data_dir: Path) -> None:
     marker = data_dir / MOVED_MARKER
     if marker.exists() and not on_server():
@@ -51,6 +60,10 @@ class NeedsUser(Exception):
     """Ошибка, которую исправляет человек (настройки, ключи, вход) — перезапуск не поможет."""
 
 
+class AlreadyRunning(NeedsUser):
+    """Другая копия ассистента уже работает (её не трогаем и владельцу о ней не пишем)."""
+
+
 def explain(exc: BaseException) -> tuple[str, bool] | None:
     """Известная ошибка → (понятное сообщение, нужна ли правка человеком). None — неизвестная."""
     try:
@@ -60,9 +73,17 @@ def explain(exc: BaseException) -> tuple[str, bool] | None:
 
     if isinstance(exc, NeedsUser):
         return str(exc), True
-    if isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower():
-        return ("Ассистент уже запущен в другом окне (или в нём ещё идёт команда). "
-                "Закрой лишнее окно и запусти снова."), True
+    text = str(exc).lower()
+    if (isinstance(exc, sqlite3.OperationalError) and "readonly" in text) or isinstance(exc, PermissionError):
+        fix = ("tg-assistant restart (права поправятся сами)" if on_server()
+               else "проверь права на папку data")
+        return (f"Нет прав на запись в папку data: {exc}. Скорее всего, команда запускалась от другого "
+                f"пользователя (например, root). Исправить: {fix}"), True
+    if isinstance(exc, sqlite3.OperationalError) and "locked" in text:
+        # вторую копию не пускает InstanceLock, так что это временная занятость базы другой командой
+        # (например, tg-assistant learn) — перезапуск поможет, останавливаться насовсем нельзя
+        return ("База данных была занята другой командой ассистента (например, изучением или резервной "
+                "копией). Программа перезапустится сама."), False
     if tg is not None:
         if isinstance(exc, tg.ApiIdInvalidError):
             return "Неверные TG_API_ID / TG_API_HASH в файле .env — скопируй их заново с my.telegram.org.", True
@@ -89,6 +110,13 @@ def explain(exc: BaseException) -> tuple[str, bool] | None:
 def write_crash_log(data_dir: Path, exc: BaseException, command: str) -> Path:
     path = data_dir / CRASH_LOG
     data_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if path.stat().st_size > CRASH_LOG_MAX_BYTES:
+            # оставляем вторую половину — самые свежие сбои
+            tail = path.read_bytes()[-CRASH_LOG_MAX_BYTES // 2:]
+            path.write_bytes("...(старые записи удалены)\n".encode() + tail.split(b"\n", 1)[-1])
+    except OSError:
+        pass
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S}  команда: {command}\n")
         f.write(f"Python {sys.version.split()[0]} · {platform.platform()}\n")
@@ -107,15 +135,14 @@ def last_crash(data_dir: Path) -> tuple[float, str] | None:
     return (path.stat().st_mtime, lines[-1][:300]) if lines else None
 
 
-class InstanceLock:
-    """Не даёт запустить две копии, работающие с Telegram, одновременно (иначе «database is locked»
-    и даже сброс сессии). Блокировка снимается сама, если программа закрылась или упала."""
+class FileLock:
+    """Межпроцессная блокировка на файле. Снимается сама, если программа закрылась или упала."""
 
-    def __init__(self, data_dir: Path):
-        self.path = data_dir / "assistant.lock"
+    def __init__(self, path: Path):
+        self.path = path
         self._fh = None
 
-    def __enter__(self) -> InstanceLock:
+    def try_acquire(self) -> bool:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = open(self.path, "a+")  # noqa: SIM115 — держим открытым всё время работы
         try:
@@ -129,9 +156,11 @@ class InstanceLock:
         except OSError:
             self._fh.close()
             self._fh = None
-            raise NeedsUser("Ассистент уже запущен в другом окне. Закрой его (или дождись конца команды) "
-                            "и запусти снова.") from None
-        return self
+            return False
+        return True
+
+    def release(self) -> None:
+        self.__exit__()
 
     def __exit__(self, *exc) -> None:
         if self._fh is not None:
@@ -144,3 +173,20 @@ class InstanceLock:
                 pass
             self._fh.close()
             self._fh = None
+
+
+class InstanceLock(FileLock):
+    """Не даёт запустить две копии, работающие с Telegram, одновременно (иначе «database is locked»
+    и даже сброс сессии)."""
+
+    def __init__(self, data_dir: Path):
+        super().__init__(data_dir / "assistant.lock")
+
+    def __enter__(self) -> InstanceLock:
+        if not self.try_acquire():
+            if on_server():
+                raise AlreadyRunning("Ассистент уже работает (служба или другая команда). Посмотреть: "
+                                     "tg-assistant status; остановить службу: tg-assistant stop")
+            raise AlreadyRunning("Ассистент уже запущен в другом окне. Закрой его (или дождись конца команды) "
+                                 "и запусти снова.")
+        return self

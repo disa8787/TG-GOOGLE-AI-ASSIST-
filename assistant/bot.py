@@ -14,9 +14,9 @@ from telethon import TelegramClient, events, functions, types
 from .brain import Assistant
 from .config import Config
 from .jobs import Scheduler
-from .learn import learn_estimate, learn_everything
+from .learn import LearnBusy, learn_estimate, learn_everything
 from .llm import LLMError
-from .runtime import last_crash
+from .runtime import data_file_hint, last_crash, on_server
 from .telegram_archive import (
     ChatFilter,
     attach_live_listener,
@@ -100,6 +100,7 @@ async def read_attachments(bot: TelegramClient, msg) -> tuple[list[dict], list[s
 
 
 PROGRESS_EVERY_SECONDS = 90  # как часто присылать прогресс в Telegram во время долгих операций
+CRASH_REPEAT_QUIET_HOURS = 3  # тот же самый сбой повторно сообщаем не чаще, чем раз в столько часов
 YES_WORDS = {"да", "д", "y", "yes", "ага", "давай"}
 
 
@@ -128,6 +129,16 @@ class App:
         self.learn_task: asyncio.Task | None = None
         self.learn_decision: asyncio.Future | None = None
         self.stopping = False  # штатная остановка (а не обрыв связи)
+        self.sync_lock = asyncio.Lock()  # докачки не идут параллельно (старт, /download, периодическая)
+        self._background: set[asyncio.Task] = set()
+
+    def spawn(self, coro, name: str | None = None) -> asyncio.Task:
+        """Фоновая задача, на которую держим ссылку (иначе asyncio может её потерять) и которую
+        отменяем при остановке."""
+        task = asyncio.create_task(coro, name=name)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        return task
 
     # ------------------------------------------------------------------ уведомления
     async def notify(self, text: str) -> None:
@@ -149,15 +160,31 @@ class App:
         self.progress = text.strip()
 
     # ------------------------------------------------------------------ скачивание
-    async def sync(self, on_chat=None) -> int:
+    async def sync(self, on_chat=None, reconcile: bool = True) -> int:
         """Докачка (в режиме «все чаты» — и новые чаты целиком). После первой успешной — отметка «в сети»."""
-        n = await sync_chats(self.user, self.db, self.cfg, self.chat_filter, self.busy,
-                             online_since=self.online_state["since"], on_chat=on_chat)
+        async with self.sync_lock:
+            n = await sync_chats(self.user, self.db, self.cfg, self.chat_filter, self.busy, reconcile=reconcile,
+                                 online_since=self.online_state["since"], on_chat=on_chat)
         self.online_state["since"] = None
         if not self.heartbeat_started:
             self.heartbeat_started = True
             self.tasks.append(asyncio.create_task(self.sched.heartbeat_loop(), name="heartbeat"))
         return n
+
+    async def resync_loop(self) -> None:
+        """Подстраховка для работы 24/7: раз в N минут сверяемся с Telegram и докачиваем то, что не пришло
+        в реальном времени (после обрыва связи Telegram иногда «теряет» часть обновлений)."""
+        minutes = self.cfg.resync_minutes
+        if minutes <= 0:
+            return
+        while True:
+            await asyncio.sleep(minutes * 60)
+            try:
+                n = await self.sync(reconcile=False)
+                if n:
+                    log.info("Периодическая сверка: докачано %s сообщений, не пришедших вовремя", n)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Периодическая сверка не удалась (повторю позже): %s", e)
 
     async def download_all(self, *, to_bot: bool) -> int:
         """Скачать/докачать всю историю с понятным прогрессом. Возвращает число новых сообщений."""
@@ -171,7 +198,7 @@ class App:
             self.say(f"📥 Чат {i} из {total}: «{title}» +{n}. В архиве {st['n']} сообщений.")
             if to_bot and time.monotonic() - last_sent > PROGRESS_EVERY_SECONDS:
                 last_sent = time.monotonic()
-                asyncio.create_task(self.safe_notify(f"⏳ {self.progress}"))
+                self.spawn(self.safe_notify(f"⏳ {self.progress}"))
 
         self.say("📥 Скачиваю историю Telegram (только чтение, ничего не отправляю и не отмечаю прочитанным)…")
         await self.sync(on_chat=on_chat)
@@ -245,9 +272,18 @@ class App:
             self.say(text)
             if time.monotonic() - last_sent > PROGRESS_EVERY_SECONDS:
                 last_sent = time.monotonic()
-                asyncio.create_task(self.safe_notify(f"⏳ Изучаю: {self.progress}"))
+                self.spawn(self.safe_notify(f"⏳ Изучаю: {self.progress}"))
 
-        ok = await learn_everything(self.asst, say)
+        try:
+            ok = await learn_everything(self.asst, say)
+        except LearnBusy as e:
+            await self.safe_notify(f"⏳ {e}")
+            return
+        except Exception as e:  # noqa: BLE001 — сеть, база и т.п.: прогресс сохранён, можно продолжить
+            log.exception("Ошибка изучения истории")
+            await self.safe_notify(f"⚠️ Изучение прервалось: {type(e).__name__}: {e}\n"
+                                   "Прогресс сохранён, продолжить — /learn")
+            return
         if not ok:
             await self.safe_notify(f"⚠️ Изучение остановилось: {self.progress}\nПрогресс сохранён, продолжить — /learn")
             return
@@ -256,7 +292,8 @@ class App:
         await self.safe_notify(
             f"✅ Изучил историю. В памяти {self.db.memory_count()} заметок.\n\n"
             f"Вот как я понял твою работу:\n\n{excerpt}\n\n"
-            "Полностью — в файле data\\profile.md. Если что-то не так — поправь файл или просто напиши мне."
+            f"Полностью — в файле {data_file_hint('profile.md')}. Если что-то не так — поправь файл "
+            "или просто напиши мне."
         )
 
     async def startup_learning(self) -> None:
@@ -265,7 +302,7 @@ class App:
         if est["parts"] == 0:
             return
         self.phase = "learn"
-        self.progress = "жду твоего решения об изучении истории"
+        self.progress = "жду твоего решения: /learn_yes — изучить историю, /learn_no — отложить"
         self.learn_decision = asyncio.get_running_loop().create_future()
         offer = self.learn_offer_text(est)
         print("\n" + offer.split("\nНачать?")[0], flush=True)
@@ -282,7 +319,7 @@ class App:
     def start_background_learning(self) -> str:
         if self.learn_task is not None and not self.learn_task.done():
             return f"⏳ Уже изучаю: {self.progress}"
-        self.learn_task = asyncio.create_task(self.learn_all(), name="learn")
+        self.learn_task = self.spawn(self.learn_all(), name="learn")
         return "Начинаю изучать историю. Буду присылать прогресс, по окончании покажу, что понял."
 
     # ------------------------------------------------------------------ бот
@@ -376,7 +413,7 @@ class App:
                         except Exception as e:  # noqa: BLE001
                             log.exception("Ошибка скачивания")
                             await self.safe_notify(f"⚠️ Скачивание прервалось: {e}. Повтори /download")
-                    self.download_task = asyncio.create_task(job(), name="download")
+                    self.download_task = self.spawn(job(), name="download")
                 elif cmd == "/learn":
                     est = learn_estimate(self.asst)
                     if est["parts"] == 0:
@@ -387,7 +424,7 @@ class App:
                         async def wait_decision(fut) -> None:
                             if await fut:
                                 await self.safe_notify(self.start_background_learning())
-                        asyncio.create_task(wait_decision(self.learn_decision))
+                        self.spawn(wait_decision(self.learn_decision))
                         await send(bot, chat_id, self.learn_offer_text(est).replace(
                             " (или «да» в окне программы)", ""))
                 elif cmd[1:] in cfg.commands:
@@ -442,7 +479,15 @@ class App:
         if when <= float(self.db.get_kv("crash_reported") or 0):
             return
         self.db.set_kv("crash_reported", str(when))
-        await self.safe_notify(f"⚠️ Я перезапустился после сбоя: {line}\nПодробности — в файле data\\crash.log")
+        # один и тот же сбой подряд (например, сеть пропадает раз за разом) — не засыпаем владельца сообщениями
+        last_line, last_time = self.db.get_kv("crash_reported_line"), float(self.db.get_kv("crash_reported_at") or 0)
+        if line == last_line and time.time() - last_time < CRASH_REPEAT_QUIET_HOURS * 3600:
+            log.info("Повтор того же сбоя — владельцу не пишу: %s", line)
+            return
+        self.db.set_kv("crash_reported_line", line)
+        self.db.set_kv("crash_reported_at", str(time.time()))
+        await self.safe_notify(f"⚠️ Я перезапустился после сбоя: {line}\n"
+                               f"Подробности — в файле {data_file_hint('crash.log')}")
 
     # ------------------------------------------------------------------ запуск
     async def catch_up(self) -> None:
@@ -464,9 +509,46 @@ class App:
                 await self.safe_notify(f"🔄 Докачал пропущенное: {new} новых сообщений.")
             return
 
+    async def startup(self) -> None:
+        """Порядок запуска: (в первый раз) вся история → изучение → работа."""
+        cfg = self.cfg
+        mode = "все чаты" if cfg.all_chats else f"{len(cfg.chats)} выбранных чатов"
+        print(f"Режим: {mode}. Твой Telegram — только чтение.", flush=True)
+        await self.report_previous_crash()
+        for warning in cfg.warnings:
+            print(f"⚠️ {warning}", flush=True)
+        if cfg.warnings:
+            await self.safe_notify("⚠️ В config.yaml есть ошибки, эти настройки пропущены:\n• "
+                                   + "\n• ".join(cfg.warnings))
+
+        # 1) история: в самый первый раз — целиком и до запуска работы
+        first_run = self.db.get_kv("initial_download_done") is None
+        if first_run:
+            await self.first_download()
+        # 2) изучение: пока ни разу не изучали — предлагаем (стоимость показываем)
+        if not self.db.learning_started():
+            await self.startup_learning()
+        # 3) работа
+        self.phase = "ready"
+        self.progress = "готов"
+        self.tasks += self.sched.tasks()
+        self.tasks.append(asyncio.create_task(self.resync_loop(), name="resync"))
+        if not first_run:
+            self.tasks.append(asyncio.create_task(self.catch_up(), name="catch-up"))
+        where = "Остановить: tg-assistant stop." if on_server() else "Остановить — закрой окно или Ctrl+C."
+        print(f"✅ Ассистент работает. Пиши боту в Telegram. {where}", flush=True)
+        await self.safe_notify("✅ Я на связи и в курсе всего. /help — что я умею.")
+
     async def run(self) -> None:
         cfg = self.cfg
         self.user = await connect_user(cfg, self.db, interactive=True)  # аккаунт владельца — только чтение
+        try:
+            await self._run_connected()
+        finally:
+            await self._disconnect()
+
+    async def _run_connected(self) -> None:
+        cfg = self.cfg
         me = await self.user.get_me()
         self.owner_id = cfg.owner_id or me.id
         self.chat_filter.apply_to_db(self.db)
@@ -486,42 +568,35 @@ class App:
         waiters = [asyncio.create_task(self.user.run_until_disconnected())]
         if self.bot is not None:
             waiters.append(asyncio.create_task(self.bot.run_until_disconnected()))
+        # запуск идёт параллельно с ожиданием обрыва: если связь пропала посреди первой выгрузки,
+        # выходим со сбоем (служба/start.bat перезапустит), а не повторяем вечно на мёртвом соединении
+        startup = asyncio.create_task(self.startup(), name="startup")
         try:
-            mode = "все чаты" if cfg.all_chats else f"{len(cfg.chats)} выбранных чатов"
-            print(f"Режим: {mode}. Твой Telegram — только чтение.", flush=True)
-            await self.report_previous_crash()
-            for warning in cfg.warnings:
-                print(f"⚠️ {warning}", flush=True)
-            if cfg.warnings:
-                await self.safe_notify("⚠️ В config.yaml есть ошибки, эти настройки пропущены:\n• "
-                                       + "\n• ".join(cfg.warnings))
-
-            # 1) история: в самый первый раз — целиком и до запуска работы
-            first_run = self.db.get_kv("initial_download_done") is None
-            if first_run:
-                await self.first_download()
-            # 2) изучение: пока ни разу не изучали — предлагаем (стоимость показываем)
-            if not self.db.learning_started():
-                await self.startup_learning()
-            # 3) работа
-            self.phase = "ready"
-            self.progress = "готов"
-            self.tasks += self.sched.tasks()
-            if not first_run:
-                self.tasks.append(asyncio.create_task(self.catch_up(), name="catch-up"))
-            print("✅ Ассистент работает. Пиши боту в Telegram. Остановить — закрой окно или Ctrl+C.", flush=True)
-            await self.safe_notify("✅ Я на связи и в курсе всего. /help — что я умею.")
-            done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait([*waiters, startup], return_when=asyncio.FIRST_COMPLETED)
+            if startup in done and not any(w in done for w in waiters):
+                startup.result()  # ошибка запуска — наружу (журнал сбоев, перезапуск)
+                done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
             if self.stopping:
                 return
             for t in done:
-                if not t.cancelled() and t.exception() is not None:
+                if t is not startup and not t.cancelled() and t.exception() is not None:
                     raise t.exception()
-            # Telegram отключил и переподключиться не вышло — выходим со сбоем, start.bat перезапустит
+            # Telegram отключил и переподключиться не вышло — выходим со сбоем, служба/start.bat перезапустит
             raise ConnectionError("Связь с Telegram потеряна")
         finally:
-            for t in self.tasks + waiters:
+            for t in [*self.tasks, *waiters, startup, *self._background]:
                 t.cancel()
+
+    async def _disconnect(self) -> None:
+        """Аккуратно отключаемся (Telethon при этом сохраняет, до какого места получены обновления —
+        после перезапуска ничего не потеряется). Ошибки здесь уже не важны."""
+        for client in (self.bot, self.user):
+            if client is None:
+                continue
+            try:
+                await asyncio.wait_for(client.disconnect(), 10)
+            except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                pass
 
 
 def _append_notification(cfg: Config, text: str) -> None:

@@ -36,6 +36,7 @@ DEFAULTS: dict = {
         "download_media": False,
         "media_max_mb": 20,
         "reconcile_days": 3,
+        "resync_minutes": 30,
         "proxy": "",
     },
     "assistant": {
@@ -106,10 +107,83 @@ def _hm(value, default: str) -> str:
         return default
     if isinstance(value, int):
         return f"{value // 60:02d}:{value % 60:02d}"
-    text = str(value).strip()
-    if not re.fullmatch(r"\d{1,2}:\d{2}", text):
+    text = str(value).strip().replace(".", ":")
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not m or int(m[1]) > 24 or int(m[2]) > 59:
         raise SystemExit(f"Неверное время в config.yaml: {value!r} (нужно ЧЧ:ММ, например \"08:00\")")
-    return text
+    return f"{int(m[1]):02d}:{m[2]}"
+
+
+TRUE_WORDS = {"true", "yes", "on", "1", "да", "вкл", "включено", "y"}
+FALSE_WORDS = {"false", "no", "off", "0", "нет", "выкл", "выключено", "n", ""}
+
+
+def _bool(value, default: bool, where: str, warnings: list[str]) -> bool:
+    """Да/нет из config.yaml. Важно: «нет» в YAML — это текст, и bool("нет") было бы True."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in TRUE_WORDS:
+        return True
+    if text in FALSE_WORDS:
+        return False
+    warnings.append(f"{where}: ожидается true/false (да/нет), а не «{value}» — оставляю {'да' if default else 'нет'}")
+    return default
+
+
+def _int(value, default: int, where: str, warnings: list[str], minimum: int | None = None) -> int:
+    """Число из config.yaml; опечатка не роняет программу, а попадает в предупреждения."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        number = default
+    else:
+        try:
+            number = int(str(value).strip())
+        except ValueError:
+            warnings.append(f"{where}: ожидается число, а не «{value}» — беру {default}")
+            number = default
+    return max(minimum, number) if minimum is not None else number
+
+
+# пн, вт… и полные названия по-русски → mon, tue…; группы дней
+_RU_DAYS = {"пн": "mon", "по": "mon", "вт": "tue", "ср": "wed", "чт": "thu", "че": "thu", "пт": "fri",
+            "пя": "fri", "сб": "sat", "су": "sat", "вс": "sun", "во": "sun"}
+_DAY_GROUPS = {
+    "weekdays": ["mon", "tue", "wed", "thu", "fri"], "будни": ["mon", "tue", "wed", "thu", "fri"],
+    "weekends": ["sat", "sun"], "weekend": ["sat", "sun"], "выходные": ["sat", "sun"],
+    "all": None, "every": None, "daily": None, "все": None, "каждый": None, "ежедневно": None,
+}
+
+
+def _days(value, where: str, warnings: list[str]) -> list[str]:
+    """days: [mon, tue] / "пн, вт, ср" / пн-пт / будни / выходные → ['mon', 'tue', …].
+    Пусто или непонятно — все дни."""
+    items = _as_list(value)
+    if len(items) == 1 and isinstance(items[0], str):
+        text = re.sub(r"\s*[-–—]\s*", "-", items[0])  # «пт - пн» → «пт-пн», чтобы не разорвать диапазон
+        items = [x for x in re.split(r"[\s,;]+", text) if x]
+    def one(text: str) -> str | None:
+        text = text.strip().rstrip(".")
+        return text[:3] if text[:3] in WEEKDAY_KEYS else _RU_DAYS.get(text[:2])
+
+    days: set[str] = set()
+    for item in items:
+        key = str(item).strip().lower().rstrip(".")
+        if key in _DAY_GROUPS:
+            days.update(_DAY_GROUPS[key] or WEEKDAY_KEYS)
+            continue
+        ends = re.split(r"\s*[-–—]\s*", key)
+        if len(ends) == 2 and one(ends[0]) and one(ends[1]):  # диапазон: пн-пт, fri-mon
+            i, j = WEEKDAY_KEYS.index(one(ends[0])), WEEKDAY_KEYS.index(one(ends[1]))
+            days.update(WEEKDAY_KEYS[(i + k) % 7] for k in range((j - i) % 7 + 1))
+            continue
+        day = one(key)
+        if day:
+            days.add(day)
+        else:
+            warnings.append(f"{where}: непонятный день «{item}» — пропущен (пиши mon…sun или пн…вс)")
+    return [d for d in WEEKDAY_KEYS if d in days] or list(WEEKDAY_KEYS)
 
 
 ALL_WORDS = {"all", "все", "всё", "*"}
@@ -198,6 +272,7 @@ class Config:
     media_max_mb: int
     reconcile_days: int
     mask_cards: bool
+    resync_minutes: int
 
     # Google
     google_auth: str
@@ -283,6 +358,12 @@ def load_config(root: Path = ROOT) -> Config:
     data_dir = root / "data"
     data_dir.mkdir(exist_ok=True)
 
+    warnings: list[str] = []
+    for section, default in DEFAULTS.items():
+        if isinstance(default, dict) and not isinstance(raw.get(section), dict):
+            # например «report: false» вместо «report: {enabled: false}» — не падаем, а подсказываем
+            warnings.append(f"{section}: ожидаются вложенные настройки (с отступом ниже) — взяты стандартные")
+            raw[section] = _merge(default, {})
     tg, gg, cl = raw["telegram"], raw["google"], raw["claude"]
     rep, watch, mem, lrn = raw["report"], raw["watch"], raw["memory"], raw["learn"]
     all_chats, chat_specs = _chat_selection(tg.get("chats"))
@@ -293,17 +374,18 @@ def load_config(root: Path = ROOT) -> Config:
     owner = os.getenv("OWNER_ID", "").strip()
 
     sheets = []
-    for s in gg.get("sheets") or []:
-        if not s or not s.get("url") or "ВСТАВЬ" in str(s.get("url")).upper():
+    for s in _as_list(gg.get("sheets")):
+        if isinstance(s, str):
+            s = {"url": s}  # можно писать просто ссылку
+        if not isinstance(s, dict) or not s.get("url") or "ВСТАВЬ" in str(s.get("url")).upper():
             continue  # пустая запись или заглушка из примера — таблица не настроена
         sheets.append(SheetSource(
             name=str(s.get("name") or s["url"]),
             url=str(s["url"]).strip(),
-            worksheets=[str(w) for w in (s.get("worksheets") or [])],
+            worksheets=[str(w) for w in _as_list(s.get("worksheets"))],
             description=str(s.get("description") or "").strip(),
         ))
 
-    warnings: list[str] = []
     commands: dict[str, str] = {}
     raw_commands = raw.get("commands") or {}
     if not isinstance(raw_commands, dict):
@@ -326,18 +408,18 @@ def load_config(root: Path = ROOT) -> Config:
         if not isinstance(item, dict) or not str(item.get("prompt") or "").strip():
             warnings.append(f"schedule: задача №{i} без prompt — пропущена")
             continue
-        if item.get("enabled") is False:
+        if not _bool(item.get("enabled"), True, f"schedule №{i}: enabled", warnings):
             continue
-        days = [str(d).lower()[:3] for d in _as_list(item.get("days")) or WEEKDAY_KEYS]
         schedule.append(ScheduledTask(
             name=str(item.get("name") or f"Задача {i}").strip(),
             time=_hm(item.get("time"), "09:00"),
-            days=[d for d in days if d in WEEKDAY_KEYS] or list(WEEKDAY_KEYS),
+            days=_days(item.get("days"), f"schedule №{i}: days", warnings),
             prompt=str(item["prompt"]).strip(),
         ))
     assistant_cfg = raw.get("assistant") or {}
+    w = warnings
 
-    hours = str(watch.get("active_hours") or "00:00-24:00").split("-")
+    hours = re.sub(r"\s*[–—]\s*", "-", str(watch.get("active_hours") or "00:00-24:00")).split("-")
     if len(hours) != 2:
         hours = ["00:00", "24:00"]
     hours = [_hm(h.strip(), "00:00") for h in hours]
@@ -359,40 +441,45 @@ def load_config(root: Path = ROOT) -> Config:
         owner_id=int(owner) if owner.lstrip("-").isdigit() else None,
         all_chats=all_chats,
         chats=chat_specs,
-        include_channels=bool(tg.get("include_channels")),
-        include_bots=bool(tg.get("include_bots")),
-        include_saved=bool(tg.get("include_saved_messages", True)),
+        include_channels=_bool(tg.get("include_channels"), False, "telegram.include_channels", w),
+        include_bots=_bool(tg.get("include_bots"), False, "telegram.include_bots", w),
+        include_saved=_bool(tg.get("include_saved_messages"), True, "telegram.include_saved_messages", w),
         exclude_chats=exclude,
-        download_media=bool(tg.get("download_media")),
-        media_max_mb=int(tg.get("media_max_mb") or 20),
-        reconcile_days=max(0, int(tg.get("reconcile_days", 3) or 0)),
-        mask_cards=bool((raw.get("privacy") or {}).get("mask_card_numbers", True)),
+        download_media=_bool(tg.get("download_media"), False, "telegram.download_media", w),
+        media_max_mb=_int(tg.get("media_max_mb") or 20, 20, "telegram.media_max_mb", w, minimum=1),
+        reconcile_days=_int(tg.get("reconcile_days"), 3, "telegram.reconcile_days", w, minimum=0),
+        resync_minutes=_int(tg.get("resync_minutes"), 30, "telegram.resync_minutes", w, minimum=0),
+        mask_cards=_bool(raw["privacy"].get("mask_card_numbers"), True, "privacy.mask_card_numbers", w),
         google_auth=str(gg.get("auth") or "service_account"),
         google_credentials=cred,
         sheets=sheets,
-        model=str(cl["model"]),
-        watch_model=str(cl.get("watch_model") or cl["model"]),
+        model=str(cl.get("model") or DEFAULTS["claude"]["model"]).strip(),
+        watch_model=str(cl.get("watch_model") or cl.get("model") or DEFAULTS["claude"]["model"]).strip(),
         effort_chat=str(cl["effort_chat"]),
         effort_report=str(cl["effort_report"]),
         effort_learn=str(cl["effort_learn"]),
         effort_watch=str(cl["effort_watch"]),
-        fallbacks=bool(cl.get("fallbacks", True)),
-        max_tool_steps=int(cl.get("max_tool_steps") or 30),
-        report_enabled=bool(rep.get("enabled")),
+        fallbacks=_bool(cl.get("fallbacks"), True, "claude.fallbacks", w),
+        max_tool_steps=_int(cl.get("max_tool_steps") or 30, 30, "claude.max_tool_steps", w, minimum=2),
+        report_enabled=_bool(rep.get("enabled"), True, "report.enabled", w),
         report_time=_hm(rep.get("time"), "08:00"),
-        report_days=[str(d).lower()[:3] for d in (rep.get("days") or WEEKDAY_KEYS)],
+        report_days=_days(rep.get("days"), "report.days", w),
         report_instructions=str(rep.get("instructions") or DEFAULT_REPORT_INSTRUCTIONS),
-        watch_enabled=bool(watch.get("enabled")),
-        watch_interval=max(5, int(watch.get("interval_minutes") or 60)),
+        watch_enabled=_bool(watch.get("enabled"), True, "watch.enabled", w),
+        watch_interval=_int(watch.get("interval_minutes") or 60, 60, "watch.interval_minutes", w, minimum=5),
         watch_hours=(hours[0].strip(), hours[1].strip()),
-        watch_notify=bool(watch.get("notify", True)),
-        memory_max_chars=int(mem.get("max_prompt_chars") or 40000),
-        dialog_messages=int(mem.get("dialog_messages") or 20),
-        learn_chunk_chars=int(mem.get("learn_chunk_chars") or 120000),
-        nightly_learn=bool(lrn.get("nightly", True)),
+        watch_notify=_bool(watch.get("notify"), True, "watch.notify", w),
+        memory_max_chars=_int(mem.get("max_prompt_chars") or 40000, 40000, "memory.max_prompt_chars", w,
+                              minimum=2000),
+        dialog_messages=_int(mem.get("dialog_messages") or 20, 20, "memory.dialog_messages", w, minimum=2),
+        learn_chunk_chars=_int(mem.get("learn_chunk_chars") or 120000, 120000, "memory.learn_chunk_chars", w,
+                               minimum=1000),
+        nightly_learn=_bool(lrn.get("nightly"), True, "learn.nightly", w),
         nightly_time=_hm(lrn.get("time"), "03:30"),
-        profile_rebuild_days=max(1, int(lrn.get("profile_rebuild_days") or 7)),
-        nightly_max_chunks=max(1, int(lrn.get("nightly_max_chunks") or 20)),
+        profile_rebuild_days=_int(lrn.get("profile_rebuild_days") or 7, 7, "learn.profile_rebuild_days", w,
+                                  minimum=1),
+        nightly_max_chunks=_int(lrn.get("nightly_max_chunks") or 20, 20, "learn.nightly_max_chunks", w,
+                                minimum=1),
         proxy=str(tg.get("proxy") or "").strip(),
         about=_text_without_comments(assistant_cfg.get("about")),
         instructions=_text_without_comments(assistant_cfg.get("instructions")),

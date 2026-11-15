@@ -86,6 +86,8 @@ say "Python-библиотеки (пара минут)"
 [ -x "$APP/.venv/bin/python" ] || python3 -m venv "$APP/.venv"
 "$APP/.venv/bin/pip" install -q --upgrade pip
 "$APP/.venv/bin/pip" install -q -r "$APP/requirements.txt"
+(cd "$APP" && "$APP/.venv/bin/python" -c "import assistant.__main__, assistant.bot") \
+    || { echo "Программа не запускается после установки библиотек — смотри ошибку выше"; exit 1; }
 
 say "Часовой пояс"
 # на сервере часы обычно в UTC — без явного пояса отчёты пришли бы не вовремя
@@ -158,6 +160,11 @@ if [ "$HAS_SYSTEMD" -eq 1 ]; then
     systemctl restart "$SVC"
     sleep 5
     systemctl --no-pager status "$SVC" | head -5 || true
+    if ! systemctl is-active --quiet "$SVC"; then
+        echo "⚠️  Служба не запустилась. Последние сообщения:"
+        journalctl -u "$SVC" -n 20 --no-pager -o cat || true
+        echo "Исправь причину и запусти: tg-assistant start   (проверка всего: tg-assistant doctor)"
+    fi
 fi
 
 if [ "$HAS_SYSTEMD" -eq 1 ]; then

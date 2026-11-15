@@ -44,7 +44,7 @@ class RuntimeTests(unittest.TestCase):
         from telethon import errors
 
         cases = [
-            (sqlite3.OperationalError("database is locked"), True, "другом окне"),
+            (sqlite3.OperationalError("database is locked"), False, "занята"),  # временно — перезапуск
             (errors.AccessTokenInvalidError(request=None), True, "BOT_TOKEN"),
             (errors.ApiIdInvalidError(request=None), True, "TG_API_ID"),
             (errors.AuthKeyUnregisteredError(request=None), True, "Войди заново"),

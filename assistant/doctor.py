@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shutil
 import sys
 
 from .config import Config
 
 TIMEOUT = 40  # секунд на каждую сетевую проверку
+MIN_FREE_GB = 1.0  # меньше — архив, журнал и резервные копии могут упереться в диск
 
 
 class Report:
@@ -142,7 +144,7 @@ async def check_sheets(cfg: Config, rep: Report) -> None:
 
 def check_archive(cfg: Config, rep: Report) -> None:
     from .db import DB
-    from .runtime import last_crash
+    from .runtime import data_file_hint, last_crash
 
     db = DB(cfg.data_dir / "assistant.db")
     try:
@@ -155,9 +157,37 @@ def check_archive(cfg: Config, rep: Report) -> None:
             rep.info(f"Архив пуст — при запуске ({how_to('start')}) история скачается")
         crash = last_crash(cfg.data_dir)
         if crash:
-            rep.info(f"Последний сбой: {crash[1]} (data\\crash.log)")
+            rep.info(f"Последний сбой: {crash[1]} ({data_file_hint('crash.log')})")
     finally:
         db.conn.close()
+
+
+def check_disk(cfg: Config, rep: Report) -> None:
+    """Место на диске и права на запись: на сервере это частые причины «молча перестал работать»."""
+    size = 0
+    not_writable = []
+    for path in cfg.data_dir.rglob("*"):
+        try:
+            if path.is_file():
+                size += path.stat().st_size
+            if not os.access(path, os.W_OK):
+                not_writable.append(path.name)
+        except OSError:
+            continue
+    rep.info(f"Папка data занимает {size / 1024 ** 2:.0f} МБ")
+    free = shutil.disk_usage(cfg.data_dir).free / 1024 ** 3
+    rep.line(free >= MIN_FREE_GB, f"Свободно на диске: {free:.1f} ГБ",
+             "освободи место (старые резервные копии, журналы) — иначе архив перестанет пополняться")
+    writable = os.access(cfg.data_dir, os.W_OK) and not not_writable
+    rep.line(writable, "Папка data доступна для записи" + (
+        f" — кроме: {', '.join(not_writable[:5])}" if not_writable else ""),
+        "tg-assistant restart (права поправятся сами)" if _on_server() else "проверь права на папку data")
+
+
+def _on_server() -> bool:
+    from .runtime import on_server
+
+    return on_server()
 
 
 async def run_doctor(cfg: Config) -> bool:
@@ -200,7 +230,8 @@ async def run_doctor(cfg: Config) -> bool:
             if bot_ok:
                 await check_bot(cfg, rep, owner)
     except NeedsUser:
-        rep.info("Ассистент сейчас запущен в другом окне — проверку Telegram и бота пропускаю "
+        where = "служба ассистента работает" if on_server() else "ассистент сейчас запущен в другом окне"
+        rep.info(f"{where.capitalize()} — проверку Telegram и бота пропускаю "
                  "(они заняты им; раз он работает, связь есть)")
     if key:
         await check_claude(cfg, rep)
@@ -208,6 +239,7 @@ async def run_doctor(cfg: Config) -> bool:
 
     print("\nДанные:")
     check_archive(cfg, rep)
+    check_disk(cfg, rep)
 
     print()
     if rep.problems:

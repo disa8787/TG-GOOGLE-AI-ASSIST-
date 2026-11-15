@@ -888,6 +888,8 @@ async def sync_chats(client: TelegramClient, db: DB, cfg: Config, chat_filter: C
 
 
 # ---------------------------------------------------------------------- живое прослушивание
+_BACKGROUND: set[asyncio.Task] = set()
+
 async def _is_excluded_migration(client: TelegramClient, db: DB, chat_filter: ChatFilter, entity) -> bool:
     """Новая супергруппа может быть продолжением исключённой группы — проверяем (запрос только на чтение)."""
     if not isinstance(entity, Channel) or not entity.megagroup:
@@ -948,7 +950,9 @@ def attach_live_listener(client: TelegramClient, db: DB, cfg: Config, chat_filte
             if await _is_excluded_migration(client, db, chat_filter, entity):
                 return
             downloading.add(chat_id)
-            asyncio.create_task(_download_new_chat(chat_id, entity))
+            task = asyncio.create_task(_download_new_chat(chat_id, entity))
+            _BACKGROUND.add(task)  # ссылка нужна, иначе asyncio может потерять задачу посреди выгрузки
+            task.add_done_callback(_BACKGROUND.discard)
             return
         try:
             row = await message_to_row(msg, chat_id, fetch_sender=True, **_media_args(cfg))

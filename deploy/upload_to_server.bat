@@ -23,6 +23,12 @@ set "REPLACE="
 if exist "data\MOVED_TO_SERVER.txt" set /p REPLACE=Заменить config.yaml на сервере этим? [y/N]: 
 if /i "%REPLACE%"=="y" set "FLAG=--replace-config"
 
+rem Ассистент здесь должен быть закрыт, а база сведена в один файл — иначе копия архива может быть битой
+if not exist ".venv\Scripts\python.exe" goto pack
+".venv\Scripts\python.exe" -m assistant prepare-move
+if errorlevel 1 goto still_running
+
+:pack
 set "PKG=%TEMP%\tg-assistant.tar.gz"
 echo.
 echo Упаковываю...
@@ -49,6 +55,11 @@ goto end
 :no_ssh
 echo Не найдена программа ssh. В Windows 10/11 включи её:
 echo Параметры - Приложения - Дополнительные компоненты - Добавить компонент - «Клиент OpenSSH».
+goto end
+
+:still_running
+echo Не получилось подготовить данные (сообщение выше). Чаще всего ассистент ещё запущен:
+echo закрой окно start.bat и запусти этот файл снова.
 goto end
 
 :pack_failed

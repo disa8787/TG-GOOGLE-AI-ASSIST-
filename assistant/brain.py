@@ -50,6 +50,8 @@ class Assistant:
         ChatFilter(cfg, self.db).apply_to_db(self.db)
         # Claude обрабатывает по одной задаче за раз — так проще и дешевле
         self.lock = asyncio.Lock()
+        # изучение истории — только одно за раз (кнопка в боте, ночное, команда learn)
+        self.learn_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------ контекст
     @property
@@ -65,7 +67,10 @@ class Assistant:
         return text or None
 
     def save_profile(self, text: str) -> None:
-        self.profile_path.write_text(text.strip() + "\n", encoding="utf-8")
+        # через временный файл: сбой посреди записи не оставит профиль обрезанным
+        tmp = self.profile_path.with_suffix(".md.tmp")
+        tmp.write_text(text.strip() + "\n", encoding="utf-8")
+        tmp.replace(self.profile_path)
 
     def memory_text(self, focus: str | None = None) -> str:
         """Заметки памяти для модели. Если все не помещаются — сначала те, что относятся к focus
@@ -284,7 +289,7 @@ class Assistant:
             f"Отслеживаются: {sum(1 for c in chats if c['monitored'])} чатов"
             + (" (режим «все чаты»: новые подключаются сами)" if self.cfg.all_chats else ""),
             f"Память: {self.db.memory_count()} заметок; профиль работы: "
-            + ("есть" if self.profile() else "нет (запусти learn)"),
+            + ("есть" if self.profile() else "нет (изучить: /learn в боте)"),
             f"Таблиц настроено: {len(self.cfg.sheets)}",
             f"Активных напоминаний: {len(reminders)}",
             "Последний отчёт: " + (fmt_local(last_report[-1]["created_at"], self.cfg.tz) if last_report else "—"),

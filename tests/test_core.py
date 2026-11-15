@@ -300,7 +300,7 @@ class ConfigTests(unittest.TestCase):
             (root / "config.yaml").write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
             cfg = load_config(root)
             self.assertEqual(cfg.report_time, "08:30")
-            self.assertEqual(cfg.watch_hours, ("7:00", "22:00"))
+            self.assertEqual(cfg.watch_hours, ("07:00", "22:00"))
             self.assertEqual(str(cfg.tz), "Europe/Moscow")
 
 
